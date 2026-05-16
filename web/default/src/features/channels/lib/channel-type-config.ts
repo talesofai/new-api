@@ -134,6 +134,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       baseUrl: 'Default: https://api.replicate.com',
     },
   },
+  58: {
+    id: 58,
+    name: CHANNEL_TYPES[58],
+    icon: 'openai',
+    hints: {
+      key: 'Unused; Dramatiq uses Redis broker',
+      models: 'dramatiq-noobxl-t2i,dramatiq-noobxl-i2i-tile,dramatiq-remove-bg',
+      baseUrl: 'Leave empty; callback address comes from server settings',
+    },
+  },
 }
 
 /**

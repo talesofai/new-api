@@ -5,6 +5,7 @@ import (
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/dramatiq"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -48,6 +49,12 @@ func SetRelayRouter(router *gin.Engine) {
 		geminiRouter.GET("", func(c *gin.Context) {
 			controller.ListModels(c, constant.ChannelTypeGemini)
 		})
+	}
+
+	dramatiqCallbackRouter := router.Group("/v1/dramatiq")
+	dramatiqCallbackRouter.Use(middleware.RouteTag("relay"))
+	{
+		dramatiqCallbackRouter.POST("/callback/image", dramatiq.ImageCallback)
 	}
 
 	geminiCompatibleRouter := router.Group("/v1beta/openai/models")

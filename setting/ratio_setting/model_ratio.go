@@ -308,6 +308,13 @@ var defaultModelPrice = map[string]float64{
 	"veo-3.0-fast-generate-001":      0.15,
 	"veo-3.1-generate-preview":       0.4,
 	"veo-3.1-fast-generate-preview":  0.15,
+	"dramatiq-noobxl-t2i":            0.2,
+	"dramatiq-lumina-t2i":            0.2,
+	"dramatiq-noobxl-i2i-tile":       0.2,
+	"dramatiq-noobxl-i2i-ipa":        0.2,
+	"dramatiq-noobxl-i2i-openpose":   0.2,
+	"dramatiq-remove-bg":             0.2,
+	"dramatiq-lineart":               0.2,
 }
 
 var defaultAudioRatio = map[string]float64{
