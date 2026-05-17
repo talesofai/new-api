@@ -72,7 +72,7 @@ func extractCallbackResult(v any) (url string, b64 string, errMsg string) {
 }
 
 func extractResultMap(m map[string]any) (url string, b64 string, errMsg string) {
-	for _, key := range []string{"url", "image_url", "output_url", "oss_url"} {
+	for _, key := range []string{"img_url", "url", "image_url", "output_url", "oss_url"} {
 		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
 			url = strings.TrimSpace(s)
 			break

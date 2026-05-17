@@ -55,6 +55,7 @@ func SetRelayRouter(router *gin.Engine) {
 	dramatiqCallbackRouter.Use(middleware.RouteTag("relay"))
 	{
 		dramatiqCallbackRouter.POST("/callback/image", dramatiq.ImageCallback)
+		dramatiqCallbackRouter.PUT("/callback/image", dramatiq.ImageCallback)
 	}
 
 	geminiCompatibleRouter := router.Group("/v1beta/openai/models")

@@ -39,7 +39,7 @@ func TestBuildI2IPayloadRequiresImage(t *testing.T) {
 }
 
 func TestExtractCallbackResult(t *testing.T) {
-	url, _, errMsg := extractCallbackResult(map[string]any{"url": "https://example.com/a.png", "error_msg": ""})
+	url, _, errMsg := extractCallbackResult(map[string]any{"img_url": "https://example.com/a.png", "error_msg": ""})
 	require.Equal(t, "https://example.com/a.png", url)
 	require.Empty(t, errMsg)
 }
