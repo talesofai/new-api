@@ -72,19 +72,10 @@ func extractCallbackResult(v any) (url string, b64 string, errMsg string) {
 }
 
 func extractResultMap(m map[string]any) (url string, b64 string, errMsg string) {
-	for _, key := range []string{"img_url", "url", "image_url", "output_url", "oss_url"} {
-		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
-			url = strings.TrimSpace(s)
-			break
-		}
+	if s, ok := m["img_url"].(string); ok {
+		url = strings.TrimSpace(s)
 	}
-	for _, key := range []string{"b64_json", "base64", "b64"} {
-		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
-			b64 = strings.TrimSpace(s)
-			break
-		}
-	}
-	for _, key := range []string{"error_msg", "display_error_msg", "message"} {
+	for _, key := range []string{"error_msg", "display_error_msg"} {
 		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
 			errMsg = strings.TrimSpace(s)
 			break
