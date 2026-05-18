@@ -135,6 +135,9 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	if err := common.DecodeJson(requestBody, &req); err != nil {
 		return nil, err
 	}
+	if err := validateConvertedRequest(req); err != nil {
+		return nil, err
+	}
 	cfg, err := resolveModelConfig(info.UpstreamModelName, channelSettings(info))
 	if err != nil {
 		return nil, err
@@ -153,6 +156,16 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewReader(body)),
 	}, nil
+}
+
+func validateConvertedRequest(req convertedRequest) error {
+	if strings.TrimSpace(req.TaskID) == "" || len(req.Params) == 0 {
+		return errors.New("dramatiq provider does not support request body passthrough")
+	}
+	if req.TimeoutSeconds <= 0 {
+		return errors.New("dramatiq request timeout_seconds is required")
+	}
+	return nil
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {

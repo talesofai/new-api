@@ -60,12 +60,21 @@ func extractCallbackResult(v any) (url string, errMsg string) {
 	case map[string]any:
 		return extractResultMap(t)
 	case []any:
-		if len(t) == 0 {
-			return "", ""
+		var firstErr string
+		for _, item := range t {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			url, errMsg := extractResultMap(m)
+			if url != "" {
+				return url, errMsg
+			}
+			if firstErr == "" {
+				firstErr = errMsg
+			}
 		}
-		if m, ok := t[0].(map[string]any); ok {
-			return extractResultMap(m)
-		}
+		return "", firstErr
 	}
 	return "", ""
 }

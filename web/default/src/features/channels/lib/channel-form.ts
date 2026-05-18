@@ -95,6 +95,44 @@ export const channelFormSchema = z.object({
   upstream_model_update_check_enabled: z.boolean().optional(),
   upstream_model_update_auto_sync_enabled: z.boolean().optional(),
   upstream_model_update_ignored_models: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.type !== 58) return
+
+  if (!data.dramatiq_broker_url?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['dramatiq_broker_url'],
+      message: 'Dramatiq Broker URL is required',
+    })
+  }
+
+  const rawModels = data.dramatiq_models?.trim() || ''
+  if (!rawModels) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['dramatiq_models'],
+      message: 'Dramatiq models are required',
+    })
+    return
+  }
+
+  try {
+    const parsed = JSON.parse(rawModels)
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      Object.keys(parsed).length === 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['dramatiq_models'],
+        message: 'Dramatiq models must contain at least one model',
+      })
+    }
+  } catch {
+    // The field-level JSON validator reports the syntax error.
+  }
 })
 
 export type ChannelFormValues = z.infer<typeof channelFormSchema>

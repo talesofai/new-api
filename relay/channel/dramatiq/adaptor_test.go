@@ -2,6 +2,7 @@ package dramatiq
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
@@ -81,6 +82,24 @@ func TestResolveModelConfigRequiresBrokerURL(t *testing.T) {
 	require.ErrorContains(t, err, "dramatiq_broker_url is required")
 }
 
+func TestDoRequestRejectsPassthroughBody(t *testing.T) {
+	adaptor := &Adaptor{}
+	_, err := adaptor.DoRequest(nil, dramatiqRelayInfo(
+		relayconstant.RelayModeImagesGenerations,
+		"dramatiq-noobxl-t2i",
+	), strings.NewReader(`{"model":"dramatiq-noobxl-t2i","prompt":"cat"}`))
+	require.ErrorContains(t, err, "does not support request body passthrough")
+}
+
+func TestDoRequestRequiresConvertedParams(t *testing.T) {
+	adaptor := &Adaptor{}
+	_, err := adaptor.DoRequest(nil, dramatiqRelayInfo(
+		relayconstant.RelayModeImagesGenerations,
+		"dramatiq-noobxl-t2i",
+	), strings.NewReader(`{"task_id":"task-1","timeout_seconds":60}`))
+	require.ErrorContains(t, err, "does not support request body passthrough")
+}
+
 func TestExtractCallbackResult(t *testing.T) {
 	url, errMsg := extractCallbackResult(map[string]any{"img_url": "https://example.com/a.png", "error_msg": ""})
 	require.Equal(t, "https://example.com/a.png", url)
@@ -93,8 +112,26 @@ func TestExtractCallbackResultFromArray(t *testing.T) {
 	require.Empty(t, errMsg)
 }
 
+func TestExtractCallbackResultScansArrayForImage(t *testing.T) {
+	url, errMsg := extractCallbackResult([]any{
+		map[string]any{"text": "tags"},
+		map[string]any{"img_url": "https://example.com/a.png"},
+	})
+	require.Equal(t, "https://example.com/a.png", url)
+	require.Empty(t, errMsg)
+}
+
 func TestExtractCallbackResultFailure(t *testing.T) {
 	url, errMsg := extractCallbackResult(map[string]any{"error_msg": "workflow failed"})
+	require.Empty(t, url)
+	require.Equal(t, "workflow failed", errMsg)
+}
+
+func TestExtractCallbackResultFailureFromArray(t *testing.T) {
+	url, errMsg := extractCallbackResult([]any{
+		map[string]any{"text": "tags"},
+		map[string]any{"error_msg": "workflow failed"},
+	})
 	require.Empty(t, url)
 	require.Equal(t, "workflow failed", errMsg)
 }
