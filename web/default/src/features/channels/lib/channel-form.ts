@@ -61,6 +61,23 @@ export const channelFormSchema = z.object({
   pass_through_body_enabled: z.boolean().optional(),
   system_prompt: z.string().optional(),
   system_prompt_override: z.boolean().optional(),
+  dramatiq_broker_url: z.string().optional(),
+  dramatiq_namespace: z.string().optional(),
+  dramatiq_models: z
+    .string()
+    .optional()
+    .refine(
+      (value) => {
+        if (!value?.trim()) return true
+        try {
+          JSON.parse(value)
+          return true
+        } catch {
+          return false
+        }
+      },
+      { message: 'Dramatiq models must be valid JSON' }
+    ),
   // Type-specific settings (stored in settings JSON)
   is_enterprise_account: z.boolean().optional(), // OpenRouter specific
   vertex_key_type: z.enum(['json', 'api_key']).optional(), // Vertex AI specific
@@ -119,6 +136,9 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   pass_through_body_enabled: false,
   system_prompt: '',
   system_prompt_override: false,
+  dramatiq_broker_url: '',
+  dramatiq_namespace: 'dramatiq',
+  dramatiq_models: '{}',
   // Type-specific settings
   is_enterprise_account: false,
   vertex_key_type: 'json',
@@ -155,6 +175,9 @@ export function transformChannelToFormDefaults(
     pass_through_body_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
+    dramatiq_broker_url: '',
+    dramatiq_namespace: 'dramatiq',
+    dramatiq_models: '{}',
   }
 
   if (channel.setting) {
@@ -167,6 +190,9 @@ export function transformChannelToFormDefaults(
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         system_prompt: parsed.system_prompt || '',
         system_prompt_override: parsed.system_prompt_override || false,
+        dramatiq_broker_url: parsed.dramatiq_broker_url || '',
+        dramatiq_namespace: parsed.dramatiq_namespace || 'dramatiq',
+        dramatiq_models: JSON.stringify(parsed.dramatiq_models || {}, null, 2),
       }
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -269,13 +295,20 @@ export function transformChannelToFormDefaults(
  * Build the setting JSON string from form extra settings
  */
 function buildSettingJSON(formData: ChannelFormValues): string {
-  const settingObj = {
+  const settingObj: Record<string, unknown> = {
     force_format: formData.force_format || false,
     thinking_to_content: formData.thinking_to_content || false,
     proxy: formData.proxy || '',
     pass_through_body_enabled: formData.pass_through_body_enabled || false,
     system_prompt: formData.system_prompt || '',
     system_prompt_override: formData.system_prompt_override || false,
+  }
+  if (formData.type === 58) {
+    settingObj.dramatiq_broker_url = formData.dramatiq_broker_url || ''
+    settingObj.dramatiq_namespace = formData.dramatiq_namespace || 'dramatiq'
+    settingObj.dramatiq_models = formData.dramatiq_models
+      ? JSON.parse(formData.dramatiq_models)
+      : {}
   }
   return JSON.stringify(settingObj)
 }
@@ -409,8 +442,8 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
     models: formData.models,
     group: formatGroups(formData.group),
     model_mapping: formData.model_mapping || null,
-    priority: formData.priority || null,
-    weight: formData.weight || null,
+    priority: formData.priority ?? 0,
+    weight: formData.weight ?? 0,
     test_model: formData.test_model || null,
     auto_ban: formData.auto_ban ?? 1,
     status: formData.status,

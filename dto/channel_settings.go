@@ -1,12 +1,24 @@
 package dto
 
 type ChannelSettings struct {
-	ForceFormat            bool   `json:"force_format,omitempty"`
-	ThinkingToContent      bool   `json:"thinking_to_content,omitempty"`
-	Proxy                  string `json:"proxy"`
-	PassThroughBodyEnabled bool   `json:"pass_through_body_enabled,omitempty"`
-	SystemPrompt           string `json:"system_prompt,omitempty"`
-	SystemPromptOverride   bool   `json:"system_prompt_override,omitempty"`
+	ForceFormat            bool                            `json:"force_format,omitempty"`
+	ThinkingToContent      bool                            `json:"thinking_to_content,omitempty"`
+	Proxy                  string                          `json:"proxy"`
+	PassThroughBodyEnabled bool                            `json:"pass_through_body_enabled,omitempty"`
+	SystemPrompt           string                          `json:"system_prompt,omitempty"`
+	SystemPromptOverride   bool                            `json:"system_prompt_override,omitempty"`
+	DramatiqBrokerURL      string                          `json:"dramatiq_broker_url,omitempty"`
+	DramatiqNamespace      string                          `json:"dramatiq_namespace,omitempty"`
+	DramatiqModels         map[string]DramatiqModelSetting `json:"dramatiq_models,omitempty"`
+}
+
+type DramatiqModelSetting struct {
+	Adopt       string `json:"adopt"`
+	Actor       string `json:"actor,omitempty"`
+	Queue       string `json:"queue"`
+	TaskName    string `json:"task_name,omitempty"`
+	Workflow    string `json:"workflow_name"`
+	TimeoutSecs int    `json:"timeout_seconds,omitempty"`
 }
 
 type VertexKeyType string

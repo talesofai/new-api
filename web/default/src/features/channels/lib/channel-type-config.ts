@@ -139,7 +139,7 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
     name: CHANNEL_TYPES[58],
     icon: 'openai',
     hints: {
-      key: 'Unused; Dramatiq uses Redis broker',
+      key: 'Unused; configure Redis broker in advanced settings',
       models: 'dramatiq-noobxl-t2i,dramatiq-noobxl-i2i-tile,dramatiq-remove-bg',
       baseUrl: 'Leave empty; callback address comes from server settings',
     },

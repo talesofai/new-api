@@ -86,6 +86,19 @@ export interface ChannelSettings {
   pass_through_body_enabled?: boolean
   system_prompt?: string
   system_prompt_override?: boolean
+  dramatiq_broker_url?: string
+  dramatiq_namespace?: string
+  dramatiq_models?: Record<
+    string,
+    {
+      adopt: string
+      actor?: string
+      queue: string
+      task_name?: string
+      workflow_name: string
+      timeout_seconds?: number
+    }
+  >
 }
 
 export interface ChannelOtherSettings {

@@ -3,6 +3,8 @@ package dramatiq
 type modelConfig struct {
 	Adopt       string `json:"adopt"`
 	Actor       string `json:"actor"`
+	BrokerURL   string `json:"dramatiq_broker_url"`
+	Namespace   string `json:"dramatiq_namespace"`
 	Queue       string `json:"queue"`
 	TaskName    string `json:"task_name"`
 	Workflow    string `json:"workflow_name"`
@@ -27,17 +29,20 @@ type dramatiqMessage struct {
 
 type callbackPayload struct {
 	TaskID   string `json:"taskId"`
-	TaskID2  string `json:"task_id"`
 	TaskName string `json:"task_name"`
 	Status   string `json:"status"`
 	Result   any    `json:"result"`
-	ErrorMsg string `json:"error_msg"`
 }
 
 type callbackResult struct {
-	TaskID  string `json:"task_id"`
-	Status  string `json:"status"`
-	URL     string `json:"url,omitempty"`
-	B64JSON string `json:"b64_json,omitempty"`
-	Error   string `json:"error,omitempty"`
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	URL    string `json:"url,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type callbackTaskResult struct {
+	ImageURL        string `json:"img_url"`
+	ErrorMsg        string `json:"error_msg"`
+	DisplayErrorMsg string `json:"display_error_msg"`
 }

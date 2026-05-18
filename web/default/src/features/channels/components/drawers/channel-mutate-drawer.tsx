@@ -239,6 +239,8 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.thinking_to_content ||
     values.pass_through_body_enabled ||
     values.system_prompt_override ||
+    values.dramatiq_broker_url?.trim() ||
+    (values.dramatiq_models?.trim() && values.dramatiq_models.trim() !== '{}') ||
     values.claude_beta_query ||
     values.upstream_model_update_check_enabled ||
     values.upstream_model_update_auto_sync_enabled ||
@@ -3074,6 +3076,71 @@ export function ChannelMutateDrawer({
                             </>
                           )}
                         </div>
+                      </div>
+                    )}
+
+                    {currentType === 58 && (
+                      <div className='space-y-4'>
+                        <FormField
+                          control={form.control}
+                          name='dramatiq_broker_url'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t('Dramatiq Broker URL')}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  placeholder='redis://:password@host:6379/0'
+                                  {...field}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t('Redis broker used by background Dramatiq workers')}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name='dramatiq_namespace'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t('Dramatiq Namespace')}</FormLabel>
+                              <FormControl>
+                                <Input placeholder='dramatiq' {...field} />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name='dramatiq_models'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t('Dramatiq Models')}</FormLabel>
+                              <FormControl>
+                                <Textarea
+                                  rows={8}
+                                  placeholder={`{
+  "dramatiq-noobxl-t2i": {
+    "adopt": "t2i",
+    "workflow_name": "3_noobxl/t2i_base_oc_ref_v1.json",
+    "queue": "d_noob_base"
+  }
+}`}
+                                  {...field}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t('Model to workflow and queue mapping for this channel')}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
                       </div>
                     )}
 

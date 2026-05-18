@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -29,16 +30,22 @@ const (
 	adoptSingleImageTool = "single_image_tool"
 
 	defaultActor          = "comfyui"
-	defaultQueue          = "cpu"
+	defaultNamespace      = "dramatiq"
 	defaultTaskName       = "make_image_with_comfy_common"
 	defaultTimeoutSeconds = 60
 	callbackPath          = "/v1/dramatiq/callback/image"
 	resultKeyPrefix       = "dramatiq:image:result:"
+	pendingKeyPrefix      = "dramatiq:image:pending:"
 )
 
 type Adaptor struct {
 	ChannelType int
 }
+
+var (
+	brokerClientMu sync.Mutex
+	brokerClients  = map[string]*redis.Client{}
+)
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.ChannelType = info.ChannelType
@@ -80,7 +87,7 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, fmt.Errorf("dramatiq provider only supports response_format=url")
 	}
 
-	cfg, err := resolveModelConfig(info.UpstreamModelName)
+	cfg, err := resolveModelConfig(info.UpstreamModelName, channelSettings(info))
 	if err != nil {
 		return nil, err
 	}
@@ -128,11 +135,15 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	if err := common.DecodeJson(requestBody, &req); err != nil {
 		return nil, err
 	}
-	cfg, err := resolveModelConfig(info.UpstreamModelName)
+	cfg, err := resolveModelConfig(info.UpstreamModelName, channelSettings(info))
 	if err != nil {
 		return nil, err
 	}
+	if err := markTaskPending(c.Request.Context(), req.TaskID, req.TimeoutSeconds); err != nil {
+		return nil, err
+	}
 	if err := enqueueTask(c.Request.Context(), cfg, req.TaskID, req.Params); err != nil {
+		clearTaskPending(c.Request.Context(), req.TaskID)
 		return nil, err
 	}
 
@@ -161,11 +172,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		}
 		return nil, types.NewOpenAIError(errors.New(msg), types.ErrorCodeBadResponse, http.StatusBadGateway)
 	}
-	if result.URL == "" && result.B64JSON == "" {
+	if result.URL == "" {
 		return nil, types.NewOpenAIError(errors.New("dramatiq image task returned empty result"), types.ErrorCodeEmptyResponse, http.StatusBadGateway)
 	}
 
-	image := dto.ImageData{Url: result.URL, B64Json: result.B64JSON}
+	image := dto.ImageData{Url: result.URL}
 	imageResp := dto.ImageResponse{
 		Created: common.GetTimestamp(),
 		Data:    []dto.ImageData{image},
@@ -181,17 +192,21 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 func (a *Adaptor) GetModelList() []string { return ModelList }
 func (a *Adaptor) GetChannelName() string { return ChannelName }
 
-func resolveModelConfig(model string) (modelConfig, error) {
-	configs := defaultModelConfigs()
-	cfg, ok := configs[model]
-	if !ok {
-		return modelConfig{}, fmt.Errorf("unsupported dramatiq model: %s", model)
+func channelSettings(info *relaycommon.RelayInfo) dto.ChannelSettings {
+	if info == nil || info.ChannelMeta == nil {
+		return dto.ChannelSettings{}
 	}
+	return info.ChannelSetting
+}
+
+func resolveModelConfig(model string, setting dto.ChannelSettings) (modelConfig, error) {
+	cfgSetting, ok := setting.DramatiqModels[model]
+	if !ok {
+		return modelConfig{}, fmt.Errorf("dramatiq model is not configured in channel setting: %s", model)
+	}
+	cfg := modelConfigFromSetting(cfgSetting)
 	if cfg.Actor == "" {
 		cfg.Actor = defaultActor
-	}
-	if cfg.Queue == "" {
-		cfg.Queue = defaultQueue
 	}
 	if cfg.TaskName == "" {
 		cfg.TaskName = defaultTaskName
@@ -199,22 +214,38 @@ func resolveModelConfig(model string) (modelConfig, error) {
 	if cfg.TimeoutSecs <= 0 {
 		cfg.TimeoutSecs = defaultTimeoutSeconds
 	}
+	cfg.BrokerURL = strings.TrimSpace(setting.DramatiqBrokerURL)
+	cfg.Namespace = strings.TrimSpace(setting.DramatiqNamespace)
+	if cfg.Namespace == "" {
+		cfg.Namespace = defaultNamespace
+	}
+	if cfg.BrokerURL == "" {
+		return modelConfig{}, errors.New("dramatiq_broker_url is required in channel setting")
+	}
+	if cfg.Adopt == "" {
+		return modelConfig{}, fmt.Errorf("dramatiq model %s missing adopt", model)
+	}
+	if cfg.Workflow == "" {
+		return modelConfig{}, fmt.Errorf("dramatiq model %s missing workflow_name", model)
+	}
+	if cfg.Queue == "" {
+		return modelConfig{}, fmt.Errorf("dramatiq model %s missing queue", model)
+	}
 	return cfg, nil
 }
 
-func defaultModelConfigs() map[string]modelConfig {
-	return map[string]modelConfig{
-		"dramatiq-noobxl-t2i":          {Adopt: adoptT2I, Workflow: "3_noobxl/t2i_base_oc_ref_v1.json"},
-		"dramatiq-lumina-t2i":          {Adopt: adoptT2I, Workflow: "5_lumina/gpu_t2i_base.json"},
-		"dramatiq-noobxl-i2i-tile":     {Adopt: adoptI2I, Workflow: "3_noobxl/i2i_tile_v1.json"},
-		"dramatiq-noobxl-i2i-ipa":      {Adopt: adoptI2I, Workflow: "3_noobxl/i2i_ipa_v1.json"},
-		"dramatiq-noobxl-i2i-openpose": {Adopt: adoptI2I, Workflow: "3_noobxl/i2i_openpose_v1.json"},
-		"dramatiq-remove-bg":           {Adopt: adoptSingleImageTool, Workflow: "templates/i2i_remove_bg_v2_BiRefNet.json"},
-		"dramatiq-lineart":             {Adopt: adoptSingleImageTool, Workflow: "templates/i2i_lineart_v1.json"},
+func modelConfigFromSetting(setting dto.DramatiqModelSetting) modelConfig {
+	return modelConfig{
+		Adopt:       strings.TrimSpace(setting.Adopt),
+		Actor:       strings.TrimSpace(setting.Actor),
+		Queue:       strings.TrimSpace(setting.Queue),
+		TaskName:    strings.TrimSpace(setting.TaskName),
+		Workflow:    strings.TrimSpace(setting.Workflow),
+		TimeoutSecs: setting.TimeoutSecs,
 	}
 }
 
-func buildAPIPayload(c *gin.Context, cfg modelConfig, request dto.ImageRequest, width, height int) (map[string]any, error) {
+func buildAPIPayload(_ *gin.Context, cfg modelConfig, request dto.ImageRequest, width, height int) (map[string]any, error) {
 	extra, err := rawExtra(request)
 	if err != nil {
 		return nil, err
@@ -248,7 +279,10 @@ func buildAPIPayload(c *gin.Context, cfg modelConfig, request dto.ImageRequest, 
 	case adoptT2I:
 		return payload, nil
 	case adoptI2I:
-		imageURL := firstImageURL(c, request, extra)
+		imageURL, err := singleImageURL(request, extra)
+		if err != nil {
+			return nil, err
+		}
 		if imageURL == "" {
 			return nil, errors.New("image_url is required for dramatiq i2i models")
 		}
@@ -260,7 +294,10 @@ func buildAPIPayload(c *gin.Context, cfg modelConfig, request dto.ImageRequest, 
 		}
 		return payload, nil
 	case adoptSingleImageTool:
-		imageURL := firstImageURL(c, request, extra)
+		imageURL, err := singleImageURL(request, extra)
+		if err != nil {
+			return nil, err
+		}
 		if imageURL == "" {
 			return nil, errors.New("image_url is required for dramatiq image tool models")
 		}
@@ -323,30 +360,24 @@ func parseSize(size string) (int, int, error) {
 	return w, h, nil
 }
 
-func firstImageURL(c *gin.Context, request dto.ImageRequest, extra map[string]any) string {
+func singleImageURL(request dto.ImageRequest, extra map[string]any) (string, error) {
+	for _, key := range []string{"image_urls", "images"} {
+		if _, ok := extra[key]; ok {
+			return "", errors.New("dramatiq provider only supports single image_url")
+		}
+	}
+	if len(request.Images) > 0 {
+		return "", errors.New("dramatiq provider only supports single image_url")
+	}
 	for _, key := range []string{"image_url", "image"} {
 		if s := toString(extra[key]); s != "" {
-			return s
+			return s, nil
 		}
-	}
-	if s := firstString(extra["image_urls"]); s != "" {
-		return s
-	}
-	if s := firstString(extra["images"]); s != "" {
-		return s
 	}
 	if s := firstRawString(request.Image); s != "" {
-		return s
+		return s, nil
 	}
-	if s := firstRawString(request.Images); s != "" {
-		return s
-	}
-	if c != nil && c.Request != nil && c.Request.MultipartForm != nil {
-		if values := c.Request.MultipartForm.Value["image"]; len(values) > 0 {
-			return strings.TrimSpace(values[0])
-		}
-	}
-	return ""
+	return "", nil
 }
 
 func firstRawString(raw []byte) string {
@@ -356,20 +387,6 @@ func firstRawString(raw []byte) string {
 	var s string
 	if err := common.Unmarshal(raw, &s); err == nil {
 		return strings.TrimSpace(s)
-	}
-	var arr []string
-	if err := common.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
-		return strings.TrimSpace(arr[0])
-	}
-	return ""
-}
-
-func firstString(v any) string {
-	if s := toString(v); s != "" {
-		return s
-	}
-	if arr, ok := v.([]any); ok && len(arr) > 0 {
-		return toString(arr[0])
 	}
 	return ""
 }
@@ -403,8 +420,9 @@ func floatOrDefault(v any, fallback float64) float64 {
 }
 
 func enqueueTask(ctx context.Context, cfg modelConfig, taskID string, params map[string]any) error {
-	if common.RDB == nil {
-		return errors.New("redis is not enabled")
+	client, err := getBrokerClient(cfg.BrokerURL)
+	if err != nil {
+		return err
 	}
 	redisMessageID := uuid.New().String()
 	msg := dramatiqMessage{
@@ -426,11 +444,39 @@ func enqueueTask(ctx context.Context, cfg modelConfig, taskID string, params map
 	if err != nil {
 		return err
 	}
-	pipe := common.RDB.TxPipeline()
-	pipe.HSet(ctx, "dramatiq:"+cfg.Queue+".msgs", redisMessageID, encoded)
-	pipe.RPush(ctx, "dramatiq:"+cfg.Queue, redisMessageID)
+	queueKey := dramatiqQueueKey(cfg.Namespace, cfg.Queue)
+	pipe := client.TxPipeline()
+	pipe.HSet(ctx, queueKey+".msgs", redisMessageID, encoded)
+	pipe.RPush(ctx, queueKey, redisMessageID)
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+func getBrokerClient(rawURL string) (*redis.Client, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, errors.New("dramatiq_broker_url is required")
+	}
+	brokerClientMu.Lock()
+	defer brokerClientMu.Unlock()
+	if client := brokerClients[rawURL]; client != nil {
+		return client, nil
+	}
+	opt, err := redis.ParseURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dramatiq_broker_url: %w", err)
+	}
+	client := redis.NewClient(opt)
+	brokerClients[rawURL] = client
+	return client, nil
+}
+
+func dramatiqQueueKey(namespace, queue string) string {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+	return namespace + ":" + queue
 }
 
 func waitResult(ctx context.Context, taskID string, timeout time.Duration) (*callbackResult, error) {
@@ -459,7 +505,26 @@ func waitResult(ctx context.Context, taskID string, timeout time.Duration) (*cal
 	}
 }
 
-func resultKey(taskID string) string { return resultKeyPrefix + taskID }
+func resultKey(taskID string) string  { return resultKeyPrefix + taskID }
+func pendingKey(taskID string) string { return pendingKeyPrefix + taskID }
+
+func markTaskPending(ctx context.Context, taskID string, timeoutSeconds int) error {
+	if common.RDB == nil {
+		return errors.New("redis is not enabled")
+	}
+	ttl := time.Duration(timeoutSeconds+60) * time.Second
+	if ttl <= time.Minute {
+		ttl = time.Duration(defaultTimeoutSeconds+60) * time.Second
+	}
+	return common.RDB.Set(ctx, pendingKey(taskID), "1", ttl).Err()
+}
+
+func clearTaskPending(ctx context.Context, taskID string) {
+	if common.RDB == nil {
+		return
+	}
+	common.RDB.Del(ctx, pendingKey(taskID))
+}
 
 func isSuccessStatus(status string) bool {
 	s := strings.ToUpper(strings.TrimSpace(status))
