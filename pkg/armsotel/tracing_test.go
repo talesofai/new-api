@@ -1,0 +1,186 @@
+package armsotel
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type contextKey string
+
+func TestDetachedContextKeepsValuesWithoutCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey("request_id"), "req-1"))
+	cancel()
+
+	detached := DetachedContext(ctx)
+
+	if detached.Err() != nil {
+		t.Fatalf("detached context err = %v", detached.Err())
+	}
+	if got := detached.Value(contextKey("request_id")); got != "req-1" {
+		t.Fatalf("detached context value = %v", got)
+	}
+}
+
+func TestNewRequestPreservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey("request_id"), "req-1"))
+	cancel()
+
+	req, err := NewRequest(ctx, http.MethodGet, "https://upstream.example.com/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Context().Err() != context.Canceled {
+		t.Fatalf("request context err = %v", req.Context().Err())
+	}
+	if got := req.Context().Value(contextKey("request_id")); got != "req-1" {
+		t.Fatalf("request context value = %v", got)
+	}
+}
+
+func TestWrapTransportInjectsTraceparent(t *testing.T) {
+	traceID, err := trace.TraceIDFromHex("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanID, err := trace.SpanIDFromHex("0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := trace.ContextWithRemoteSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	}))
+	var got string
+	client := &http.Client{Transport: WrapTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		got = req.Header.Get("traceparent")
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
+	}))}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://upstream.example.com/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got != "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01" {
+		t.Fatalf("traceparent = %q", got)
+	}
+}
+
+func TestWrapTransportEndsSpanAfterBodyEOF(t *testing.T) {
+	recorder, shutdown := setTestTracerProvider(t)
+	defer shutdown()
+
+	client := &http.Client{Transport: WrapTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: http.Header{}}, nil
+	}))}
+	resp, err := client.Get("https://upstream.example.com/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended := recorder.Ended(); len(ended) != 0 {
+		t.Fatalf("span ended before body read: %d", len(ended))
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if ended := recorder.Ended(); len(ended) != 1 {
+		t.Fatalf("ended spans = %d", len(ended))
+	}
+}
+
+func TestWrapTransportRecordsBodyReadError(t *testing.T) {
+	recorder, shutdown := setTestTracerProvider(t)
+	defer shutdown()
+
+	readErr := errors.New("stream failed")
+	client := &http.Client{Transport: WrapTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: failingBody{err: readErr}, Header: http.Header{}}, nil
+	}))}
+	resp, err := client.Get("https://upstream.example.com/v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.ReadAll(resp.Body)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("read error = %v", err)
+	}
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended spans = %d", len(ended))
+	}
+	if got := ended[0].Status().Code; got != codes.Error {
+		t.Fatalf("span status = %v", got)
+	}
+}
+
+func TestWrapTransportClosesBaseIdleConnections(t *testing.T) {
+	base := &closeIdleTransport{}
+	transport := WrapTransport(base)
+	closer, ok := transport.(interface{ CloseIdleConnections() })
+	if !ok {
+		t.Fatal("wrapped transport does not expose CloseIdleConnections")
+	}
+
+	closer.CloseIdleConnections()
+
+	if !base.closed {
+		t.Fatal("base idle connections were not closed")
+	}
+}
+
+func setTestTracerProvider(t *testing.T) (*tracetest.SpanRecorder, func()) {
+	t.Helper()
+	previous := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	return recorder, func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previous)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type closeIdleTransport struct {
+	closed bool
+}
+
+func (t *closeIdleTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
+}
+
+func (t *closeIdleTransport) CloseIdleConnections() {
+	t.closed = true
+}
+
+type failingBody struct {
+	err error
+}
+
+func (b failingBody) Read([]byte) (int, error) {
+	return 0, b.err
+}
+
+func (b failingBody) Close() error {
+	return nil
+}
