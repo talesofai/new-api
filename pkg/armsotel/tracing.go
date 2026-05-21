@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -62,7 +63,10 @@ func DetachedContext(ctx context.Context) context.Context {
 }
 
 func NewRequest(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
-	return http.NewRequestWithContext(DetachedContext(ctx), method, url, body)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return http.NewRequestWithContext(ctx, method, url, body)
 }
 
 func WrapTransport(base http.RoundTripper) http.RoundTripper {
@@ -99,20 +103,55 @@ func (t traceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		attribute.String("server.address", req.URL.Hostname()),
 		attribute.String("url.path", req.URL.EscapedPath()),
 	))
-	defer span.End()
 	req = req.Clone(ctx)
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		return nil, err
 	}
 	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 	if resp.StatusCode >= http.StatusInternalServerError {
 		span.SetStatus(codes.Error, http.StatusText(resp.StatusCode))
 	}
+	if resp.Body == nil {
+		span.End()
+		return resp, nil
+	}
+	resp.Body = &traceBody{ReadCloser: resp.Body, span: span}
 	return resp, nil
+}
+
+type traceBody struct {
+	io.ReadCloser
+	span trace.Span
+	once sync.Once
+}
+
+func (b *traceBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.finish(err)
+	}
+	return n, err
+}
+
+func (b *traceBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.finish(err)
+	return err
+}
+
+func (b *traceBody) finish(err error) {
+	b.once.Do(func() {
+		if err != nil && err != io.EOF {
+			b.span.RecordError(err)
+			b.span.SetStatus(codes.Error, err.Error())
+		}
+		b.span.End()
+	})
 }
 
 func firstEnv(keys ...string) string {
