@@ -127,6 +127,14 @@ const PARAM_OVERRIDE_OPERATIONS_TEMPLATE = {
   ],
 };
 
+const DRAMATIQ_MODELS_TEMPLATE = {
+  'dramatiq-noobxl-t2i': {
+    adopt: 't2i',
+    workflow_name: '3_noobxl/t2i_base_oc_ref_v1.json',
+    queue: 'd_noob_base',
+  },
+};
+
 const DEPRECATED_DOUBAO_CODING_PLAN_BASE_URL = 'doubao-coding-plan';
 
 // 支持并且已适配通过接口获取模型列表的渠道类型
@@ -155,6 +163,8 @@ function type2secretPrompt(type) {
       return '按照如下格式输入: AccessKey|SecretAccessKey';
     case 57:
       return '请输入 JSON 格式的 OAuth 凭据（必须包含 access_token 和 account_id）';
+    case 58:
+      return 'Dramatiq 渠道不使用此密钥，填入任意占位值即可';
     default:
       return '请输入渠道对应的鉴权密钥';
   }
@@ -195,6 +205,9 @@ const EditChannelModal = (props) => {
     pass_through_body_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
+    dramatiq_broker_url: '',
+    dramatiq_namespace: 'dramatiq',
+    dramatiq_models: '',
     settings: '',
     // 仅 Vertex: 密钥格式（存入 settings.vertex_key_type）
     vertex_key_type: 'json',
@@ -517,6 +530,10 @@ const EditChannelModal = (props) => {
     proxy: '',
     pass_through_body_enabled: false,
     system_prompt: '',
+    system_prompt_override: false,
+    dramatiq_broker_url: '',
+    dramatiq_namespace: 'dramatiq',
+    dramatiq_models: '',
   });
   const showApiConfigCard = true; // 控制是否显示 API 配置卡片
   const getInitValues = () => ({ ...originInputs });
@@ -870,6 +887,14 @@ const EditChannelModal = (props) => {
           data.system_prompt = parsedSettings.system_prompt || '';
           data.system_prompt_override =
             parsedSettings.system_prompt_override || false;
+          data.dramatiq_broker_url = parsedSettings.dramatiq_broker_url || '';
+          data.dramatiq_namespace =
+            parsedSettings.dramatiq_namespace || 'dramatiq';
+          data.dramatiq_models = JSON.stringify(
+            parsedSettings.dramatiq_models || {},
+            null,
+            2,
+          );
         } catch (error) {
           console.error('解析渠道设置失败:', error);
           data.force_format = false;
@@ -878,6 +903,9 @@ const EditChannelModal = (props) => {
           data.pass_through_body_enabled = false;
           data.system_prompt = '';
           data.system_prompt_override = false;
+          data.dramatiq_broker_url = '';
+          data.dramatiq_namespace = 'dramatiq';
+          data.dramatiq_models = '';
         }
       } else {
         data.force_format = false;
@@ -886,6 +914,9 @@ const EditChannelModal = (props) => {
         data.pass_through_body_enabled = false;
         data.system_prompt = '';
         data.system_prompt_override = false;
+        data.dramatiq_broker_url = '';
+        data.dramatiq_namespace = 'dramatiq';
+        data.dramatiq_models = '';
       }
 
       if (data.settings) {
@@ -995,6 +1026,9 @@ const EditChannelModal = (props) => {
         pass_through_body_enabled: data.pass_through_body_enabled,
         system_prompt: data.system_prompt,
         system_prompt_override: data.system_prompt_override || false,
+        dramatiq_broker_url: data.dramatiq_broker_url || '',
+        dramatiq_namespace: data.dramatiq_namespace || 'dramatiq',
+        dramatiq_models: data.dramatiq_models || '',
       });
       initialModelsRef.current = (data.models || [])
         .map((model) => (model || '').trim())
@@ -1645,6 +1679,14 @@ const EditChannelModal = (props) => {
       }
     }
 
+    if (
+      !isEdit &&
+      localInputs.type === 58 &&
+      (!localInputs.key || localInputs.key.trim() === '')
+    ) {
+      localInputs.key = 'dramatiq';
+    }
+
     // 如果是编辑模式且 key 为空字符串，避免提交空值覆盖旧密钥
     if (isEdit && (!localInputs.key || localInputs.key.trim() === '')) {
       delete localInputs.key;
@@ -1745,6 +1787,19 @@ const EditChannelModal = (props) => {
     if (localInputs.type === 18 && localInputs.other === '') {
       localInputs.other = 'v2.1';
     }
+    if (localInputs.type === 58) {
+      if (
+        !localInputs.dramatiq_broker_url ||
+        localInputs.dramatiq_broker_url.trim() === ''
+      ) {
+        showInfo(t('请输入 Dramatiq Broker URL'));
+        return;
+      }
+      if (!verifyJSON(localInputs.dramatiq_models || '')) {
+        showInfo(t('Dramatiq Models 必须是合法的 JSON 格式！'));
+        return;
+      }
+    }
 
     // 生成渠道额外设置JSON
     const channelExtraSettings = {
@@ -1755,6 +1810,15 @@ const EditChannelModal = (props) => {
       system_prompt: localInputs.system_prompt || '',
       system_prompt_override: localInputs.system_prompt_override || false,
     };
+    if (localInputs.type === 58) {
+      channelExtraSettings.dramatiq_broker_url =
+        localInputs.dramatiq_broker_url || '';
+      channelExtraSettings.dramatiq_namespace =
+        localInputs.dramatiq_namespace || 'dramatiq';
+      channelExtraSettings.dramatiq_models = JSON.parse(
+        localInputs.dramatiq_models || '{}',
+      );
+    }
     localInputs.setting = JSON.stringify(channelExtraSettings);
 
     // 处理 settings 字段（包括企业账户设置和字段透传控制）
@@ -1835,6 +1899,9 @@ const EditChannelModal = (props) => {
     delete localInputs.pass_through_body_enabled;
     delete localInputs.system_prompt;
     delete localInputs.system_prompt_override;
+    delete localInputs.dramatiq_broker_url;
+    delete localInputs.dramatiq_namespace;
+    delete localInputs.dramatiq_models;
     delete localInputs.is_enterprise_account;
     // 顶层的 vertex_key_type 不应发送给后端
     delete localInputs.vertex_key_type;
@@ -2527,6 +2594,71 @@ const EditChannelModal = (props) => {
                   <Form.Switch field='pass_through_body_enabled' label={t('透传请求体')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('pass_through_body_enabled', value)} extraText={t('启用请求体透传功能')} />
 
                   <Form.Input field='proxy' label={t('代理地址')} placeholder={t('例如: socks5://user:pass@host:port')} onChange={(value) => handleChannelSettingsChange('proxy', value)} showClear extraText={t('用于配置网络代理，支持 socks5 协议')} />
+
+                  {inputs.type === 58 && (
+                    <div className='space-y-3'>
+                      <Form.Input
+                        field='dramatiq_broker_url'
+                        label={t('Dramatiq Broker URL')}
+                        placeholder='redis://:password@host:6379/0'
+                        onChange={(value) =>
+                          handleChannelSettingsChange(
+                            'dramatiq_broker_url',
+                            value,
+                          )
+                        }
+                        showClear
+                        extraText={t('Redis broker used by background Dramatiq workers')}
+                      />
+                      <Form.Input
+                        field='dramatiq_namespace'
+                        label={t('Dramatiq Namespace')}
+                        placeholder='dramatiq'
+                        onChange={(value) =>
+                          handleChannelSettingsChange(
+                            'dramatiq_namespace',
+                            value,
+                          )
+                        }
+                        showClear
+                      />
+                      <Form.TextArea
+                        field='dramatiq_models'
+                        label={t('Dramatiq Models')}
+                        placeholder={JSON.stringify(
+                          DRAMATIQ_MODELS_TEMPLATE,
+                          null,
+                          2,
+                        )}
+                        autosize
+                        onChange={(value) =>
+                          handleChannelSettingsChange('dramatiq_models', value)
+                        }
+                        extraText={
+                          <div className='flex flex-col gap-1'>
+                            <Text type='tertiary' size='small'>
+                              {t('Model to workflow and queue mapping for this channel')}
+                            </Text>
+                            <Text
+                              className='!text-semi-color-primary cursor-pointer'
+                              onClick={() =>
+                                handleChannelSettingsChange(
+                                  'dramatiq_models',
+                                  JSON.stringify(
+                                    DRAMATIQ_MODELS_TEMPLATE,
+                                    null,
+                                    2,
+                                  ),
+                                )
+                              }
+                            >
+                              {t('填入模板')}
+                            </Text>
+                          </div>
+                        }
+                      />
+                    </div>
+                  )}
 
                   <Form.TextArea field='system_prompt' label={t('系统提示词')} placeholder={t('输入系统提示词，用户的系统提示词将优先于此设置')} onChange={(value) => handleChannelSettingsChange('system_prompt', value)} autosize showClear extraText={t('用户优先：如果用户在请求中指定了系统提示词，将优先使用用户的设置')} />
                   <Form.Switch field='system_prompt_override' label={t('系统提示词拼接')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('system_prompt_override', value)} extraText={t('如果用户请求中包含系统提示词，则使用此设置拼接到用户的系统提示词前面')} />
