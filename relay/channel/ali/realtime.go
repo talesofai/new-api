@@ -52,72 +52,130 @@ func getNumberOrDefault(m map[string]interface{}, key string, defaultVal float64
 	return defaultVal
 }
 
+type dashscopeModelType int
+
+const (
+	dashscopeModelTTS dashscopeModelType = iota
+	dashscopeModelASR
+	dashscopeModelOmni
+)
+
+func detectDashscopeModelType(modelName string) dashscopeModelType {
+	lower := strings.ToLower(modelName)
+	if strings.Contains(lower, "tts") {
+		return dashscopeModelTTS
+	}
+	if strings.Contains(lower, "asr") {
+		return dashscopeModelASR
+	}
+	return dashscopeModelOmni
+}
+
 // openaiToQwen converts an OpenAI realtime client event to Dashscope format.
+// For TTS models, conversation.item.create and response.create are remapped to
+// input_text_buffer events. For ASR and Omni models, these events pass through
+// unchanged since Dashscope natively supports the OpenAI event names.
 // Returns the converted message bytes, or nil if the event should be dropped.
-func openaiToQwen(message []byte) []byte {
+func openaiToQwen(message []byte, modelName string) []byte {
 	var event map[string]interface{}
 	if err := common.Unmarshal(message, &event); err != nil {
 		return message // can't parse, passthrough
 	}
 
 	evtType, _ := event["type"].(string)
+	modelType := detectDashscopeModelType(modelName)
 
 	switch evtType {
 	case "session.update":
-		return convertSessionUpdate(event)
+		return convertSessionUpdate(event, modelType)
 	case "conversation.item.create":
-		return convertItemCreate(event)
-	case "response.create":
-		return convertResponseCreate()
-	default:
-		// Ensure event_id exists for passthrough events
-		if _, ok := event["event_id"]; !ok {
-			event["event_id"] = eventID()
-			converted, _ := common.Marshal(event)
-			return converted
+		if modelType == dashscopeModelTTS {
+			return convertItemCreate(event)
 		}
-		return message
+	case "response.create":
+		if modelType == dashscopeModelTTS {
+			return convertResponseCreate()
+		}
 	}
+
+	// Passthrough: ensure event_id exists
+	if _, ok := event["event_id"]; !ok {
+		event["event_id"] = eventID()
+		converted, _ := common.Marshal(event)
+		return converted
+	}
+	return message
 }
 
 // convertSessionUpdate remaps an OpenAI session.update event to Dashscope
-// format, extracting voice/mode/response_format/sample_rate and stripping
-// internal fields (llm_api_base, llm_api_key, llm_model, preset_key).
-func convertSessionUpdate(event map[string]interface{}) []byte {
+// format, adjusting fields based on the model type:
+//   - TTS: voice, mode, response_format, sample_rate
+//   - ASR: input_audio_format, sample_rate, turn_detection
+//   - Omni: modalities, voice, input/output_audio_format, turn_detection, instructions, tools
+//
+// Internal fields (llm_api_base, llm_api_key, llm_model, preset_key) are always stripped.
+func convertSessionUpdate(event map[string]interface{}, modelType dashscopeModelType) []byte {
 	session, _ := event["session"].(map[string]interface{})
 	if session == nil {
 		session = map[string]interface{}{}
 	}
 
-	qwenSession := map[string]interface{}{
-		"voice":           getStringOrDefault(session, "voice", "Cherry"),
-		"mode":            getStringOrDefault(session, "mode", "server_commit"),
-		"response_format": getStringOrDefault(session, "response_format", "pcm"),
-		"sample_rate":     getNumberOrDefault(session, "sample_rate", 24000),
+	internalFields := map[string]bool{
+		"llm_api_base": true,
+		"llm_api_key":  true,
+		"llm_model":    true,
+		"preset_key":   true,
 	}
 
-	// Copy known optional fields
-	optionalFields := []string{
-		"volume", "speech_rate", "pitch_rate", "language_type",
-		"instructions", "enable_tn", "optimize_instructions",
-	}
-	for _, k := range optionalFields {
-		if v, ok := session[k]; ok {
-			qwenSession[k] = v
+	var qwenSession map[string]interface{}
+
+	switch modelType {
+	case dashscopeModelTTS:
+		qwenSession = map[string]interface{}{
+			"voice":           getStringOrDefault(session, "voice", "Cherry"),
+			"mode":            getStringOrDefault(session, "mode", "server_commit"),
+			"response_format": getStringOrDefault(session, "response_format", "pcm"),
+			"sample_rate":     getNumberOrDefault(session, "sample_rate", 24000),
+		}
+		for _, k := range []string{"voice", "mode", "response_format", "sample_rate"} {
+			internalFields[k] = true
+		}
+
+	case dashscopeModelASR:
+		qwenSession = map[string]interface{}{
+			"input_audio_format": getStringOrDefault(session, "input_audio_format", "pcm"),
+			"sample_rate":        getNumberOrDefault(session, "sample_rate", 16000),
+		}
+		if v, ok := session["turn_detection"]; ok {
+			qwenSession["turn_detection"] = v
+		}
+		if v, ok := session["input_audio_transcription"]; ok {
+			qwenSession["input_audio_transcription"] = v
+		}
+		for _, k := range []string{"input_audio_format", "sample_rate",
+			"voice", "mode", "response_format", "output_audio_format"} {
+			internalFields[k] = true
+		}
+
+	default: // dashscopeModelOmni
+		qwenSession = map[string]interface{}{}
+		if _, ok := session["modalities"]; !ok {
+			qwenSession["modalities"] = []string{"text", "audio"}
+		}
+		if _, ok := session["voice"]; !ok {
+			qwenSession["voice"] = "Cherry"
+		}
+		if _, ok := session["input_audio_format"]; !ok {
+			qwenSession["input_audio_format"] = "pcm"
+		}
+		if _, ok := session["output_audio_format"]; !ok {
+			qwenSession["output_audio_format"] = "pcm"
+		}
+		for _, k := range []string{"mode", "response_format"} {
+			internalFields[k] = true
 		}
 	}
 
-	// Copy any extra fields, excluding internal and already-handled ones
-	internalFields := map[string]bool{
-		"llm_api_base":    true,
-		"llm_api_key":     true,
-		"llm_model":       true,
-		"preset_key":      true,
-		"voice":           true,
-		"mode":            true,
-		"response_format": true,
-		"sample_rate":     true,
-	}
 	for k, v := range session {
 		if internalFields[k] {
 			continue
@@ -252,7 +310,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 			}
 
 			// Convert OpenAI -> Dashscope
-			converted := openaiToQwen(message)
+			converted := openaiToQwen(message, info.UpstreamModelName)
 			if converted == nil {
 				continue // event was dropped (e.g. empty text)
 			}
