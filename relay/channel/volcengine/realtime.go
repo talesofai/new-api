@@ -1,0 +1,452 @@
+package volcengine
+
+import (
+	"encoding/base64"
+	"fmt"
+	"strings"
+	"sync"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+)
+
+type realtimeState struct {
+	mu        sync.RWMutex
+	sessionID string
+	inTurn    bool
+}
+
+func (s *realtimeState) SetSessionID(id string) {
+	s.mu.Lock()
+	s.sessionID = id
+	s.mu.Unlock()
+}
+
+func (s *realtimeState) GetSessionID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sessionID
+}
+
+func (s *realtimeState) StartTurn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wasInTurn := s.inTurn
+	s.inTurn = true
+	return !wasInTurn
+}
+
+func (s *realtimeState) EndTurn() {
+	s.mu.Lock()
+	s.inTurn = false
+	s.mu.Unlock()
+}
+
+func realtimeEventID() string {
+	raw := strings.ReplaceAll(uuid.New().String(), "-", "")
+	if len(raw) > 12 {
+		raw = raw[:12]
+	}
+	return "evt_" + raw
+}
+
+func sendClientEvent(c *gin.Context, conn *websocket.Conn, event map[string]interface{}) {
+	data, err := common.Marshal(event)
+	if err != nil {
+		return
+	}
+	_ = helper.WssString(c, conn, string(data))
+}
+
+func sendBinaryJSON(conn *websocket.Conn, event EventType, sessionID string, payload []byte) error {
+	msg := &Message{
+		Version:       Version1,
+		HeaderSize:    HeaderSize4,
+		MsgType:       MsgTypeFullClientRequest,
+		MsgTypeFlag:   MsgTypeFlagWithEvent,
+		Serialization: SerializationJSON,
+		Compression:   CompressionNone,
+		EventType:     event,
+		SessionID:     sessionID,
+		Payload:       payload,
+	}
+	frame, err := msg.Marshal()
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.BinaryMessage, frame)
+}
+
+func sendBinaryAudio(conn *websocket.Conn, event EventType, sessionID string, audio []byte) error {
+	msg := &Message{
+		Version:     Version1,
+		HeaderSize:  HeaderSize4,
+		MsgType:     MsgTypeAudioOnlyClient,
+		MsgTypeFlag: MsgTypeFlagWithEvent,
+		Compression: CompressionNone,
+		EventType:   event,
+		SessionID:   sessionID,
+		Payload:     audio,
+	}
+	frame, err := msg.Marshal()
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.BinaryMessage, frame)
+}
+
+func buildDialogueConfig(session map[string]interface{}) []byte {
+	voice := "zh_female_cancan"
+	if v, ok := session["voice"].(string); ok && v != "" {
+		voice = v
+	}
+	instructions := ""
+	if v, ok := session["instructions"].(string); ok {
+		instructions = v
+	}
+
+	config := map[string]interface{}{
+		"asr": map[string]interface{}{
+			"language": "zh-CN",
+		},
+		"tts": map[string]interface{}{
+			"speaker": voice,
+			"audio_config": map[string]interface{}{
+				"channel":     1,
+				"format":      "pcm",
+				"sample_rate": 16000,
+				"bits":        16,
+			},
+		},
+		"dialog": map[string]interface{}{
+			"system_role": instructions,
+		},
+	}
+
+	props := map[string]interface{}{}
+	for _, k := range []string{"temperature", "top_p", "max_tokens"} {
+		if v, ok := session[k]; ok {
+			props[k] = v
+		}
+	}
+	if len(props) > 0 {
+		config["props"] = props
+	}
+
+	data, _ := common.Marshal(config)
+	return data
+}
+
+// VolcengineRealtimeHandler bridges an OpenAI-protocol client WebSocket to
+// the Volcengine end-to-end realtime dialogue API (binary framing at
+// wss://openspeech.bytedance.com/api/v3/realtime/dialogue).
+func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.RealtimeUsage) {
+	if info == nil || info.ClientWs == nil || info.TargetWs == nil {
+		return types.NewError(fmt.Errorf("invalid websocket connection"), types.ErrorCodeBadResponse), nil
+	}
+
+	info.IsStream = true
+	clientConn := info.ClientWs
+	targetConn := info.TargetWs
+
+	state := &realtimeState{}
+	sumUsage := &dto.RealtimeUsage{}
+
+	// --- connection handshake ---
+	if err := sendBinaryJSON(targetConn, EventType_StartConnection, "", []byte("{}")); err != nil {
+		return types.NewError(fmt.Errorf("StartConnection send failed: %v", err), types.ErrorCodeBadResponse), nil
+	}
+	connMsg, err := ReceiveMessage(targetConn)
+	if err != nil {
+		return types.NewError(fmt.Errorf("StartConnection recv failed: %v", err), types.ErrorCodeBadResponse), nil
+	}
+	if connMsg.EventType != EventType_ConnectionStarted {
+		return types.NewError(fmt.Errorf("expected ConnectionStarted, got %v", connMsg.EventType), types.ErrorCodeBadResponse), nil
+	}
+
+	sendClientEvent(c, clientConn, map[string]interface{}{
+		"event_id": realtimeEventID(),
+		"type":     "session.created",
+		"session":  map[string]interface{}{},
+	})
+
+	clientClosed := make(chan struct{})
+	targetClosed := make(chan struct{})
+	errChan := make(chan error, 2)
+
+	gopool.Go(func() {
+		<-c.Done()
+		clientConn.Close()
+		targetConn.Close()
+	})
+
+	// Client → Upstream  (OpenAI JSON → Volcengine binary)
+	gopool.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errChan <- fmt.Errorf("panic in client reader: %v", r)
+			}
+		}()
+		for {
+			msgType, message, readErr := clientConn.ReadMessage()
+			if readErr != nil {
+				if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					errChan <- fmt.Errorf("error reading client: %v", readErr)
+				}
+				close(clientClosed)
+				return
+			}
+
+			if msgType == websocket.BinaryMessage {
+				if sendErr := sendBinaryAudio(targetConn, EventType_TaskRequest, state.GetSessionID(), message); sendErr != nil {
+					errChan <- fmt.Errorf("error writing binary audio: %v", sendErr)
+					return
+				}
+				continue
+			}
+
+			var event map[string]interface{}
+			if parseErr := common.Unmarshal(message, &event); parseErr != nil {
+				continue
+			}
+			evtType, _ := event["type"].(string)
+			sid := state.GetSessionID()
+
+			switch evtType {
+			case "session.update":
+				session, _ := event["session"].(map[string]interface{})
+				if session == nil {
+					session = map[string]interface{}{}
+				}
+				cfg := buildDialogueConfig(session)
+				if sendErr := sendBinaryJSON(targetConn, EventType_StartSession, "", cfg); sendErr != nil {
+					errChan <- fmt.Errorf("StartSession send failed: %v", sendErr)
+					return
+				}
+
+			case "input_audio_buffer.append":
+				audioB64, _ := event["audio"].(string)
+				if audioB64 == "" {
+					continue
+				}
+				audioBytes, decErr := base64.StdEncoding.DecodeString(audioB64)
+				if decErr != nil {
+					continue
+				}
+				if sendErr := sendBinaryAudio(targetConn, EventType_TaskRequest, sid, audioBytes); sendErr != nil {
+					errChan <- fmt.Errorf("error sending audio: %v", sendErr)
+					return
+				}
+
+			case "input_audio_buffer.commit", "input_audio_buffer.clear":
+				// No direct equivalent in the dialogue protocol
+
+			case "conversation.item.create":
+				text := extractTextFromItem(event)
+				if text == "" {
+					continue
+				}
+				payload, _ := common.Marshal(map[string]interface{}{"text": text})
+				if sendErr := sendBinaryJSON(targetConn, EventType_UserTextQuery, sid, payload); sendErr != nil {
+					errChan <- fmt.Errorf("UserTextQuery send failed: %v", sendErr)
+					return
+				}
+
+			case "response.create":
+				// Volcengine dialogue auto-responds; no explicit trigger needed
+
+			case "response.cancel":
+				_ = sendBinaryJSON(targetConn, EventType_CancelSession, sid, []byte("{}"))
+			}
+		}
+	})
+
+	// Upstream → Client  (Volcengine binary → OpenAI JSON)
+	gopool.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errChan <- fmt.Errorf("panic in target reader: %v", r)
+			}
+		}()
+		for {
+			msg, readErr := ReceiveMessage(targetConn)
+			if readErr != nil {
+				if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					errChan <- fmt.Errorf("error reading target: %v", readErr)
+				}
+				close(targetClosed)
+				return
+			}
+			info.SetFirstResponseTime()
+
+			switch msg.EventType {
+			case EventType_SessionStarted:
+				state.SetSessionID(msg.SessionID)
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "session.updated",
+					"session":  map[string]interface{}{},
+				})
+
+			case EventType_SessionFailed:
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "error",
+					"error": map[string]interface{}{
+						"type":    "server_error",
+						"message": string(msg.Payload),
+					},
+				})
+
+			case EventType_ASRResponse:
+				var d map[string]interface{}
+				if common.Unmarshal(msg.Payload, &d) == nil {
+					if text, _ := d["text"].(string); text != "" {
+						sendClientEvent(c, clientConn, map[string]interface{}{
+							"event_id":   realtimeEventID(),
+							"type":       "conversation.item.input_audio_transcription.completed",
+							"transcript": text,
+						})
+					}
+				}
+
+			case EventType_ASRInfo:
+				var d map[string]interface{}
+				if common.Unmarshal(msg.Payload, &d) == nil {
+					if text, _ := d["text"].(string); text != "" {
+						sendClientEvent(c, clientConn, map[string]interface{}{
+							"event_id": realtimeEventID(),
+							"type":     "conversation.item.input_audio_transcription.delta",
+							"delta":    text,
+						})
+					}
+				}
+
+			case EventType_ChatResponse:
+				if state.StartTurn() {
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.created",
+						"response": map[string]interface{}{"status": "in_progress"},
+					})
+				}
+				var d map[string]interface{}
+				if common.Unmarshal(msg.Payload, &d) == nil {
+					if text, _ := d["text"].(string); text != "" {
+						sendClientEvent(c, clientConn, map[string]interface{}{
+							"event_id": realtimeEventID(),
+							"type":     "response.audio_transcript.delta",
+							"delta":    text,
+						})
+						sumUsage.OutputTokens += len([]rune(text))
+						sumUsage.OutputTokenDetails.TextTokens += len([]rune(text))
+						sumUsage.TotalTokens += len([]rune(text))
+					}
+				}
+
+			case EventType_ChatEnded:
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "response.audio_transcript.done",
+				})
+
+			case EventType_TTSResponse:
+				if len(msg.Payload) > 0 {
+					audioB64 := base64.StdEncoding.EncodeToString(msg.Payload)
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.audio.delta",
+						"delta":    audioB64,
+					})
+					audioTokens := len(msg.Payload) / 640
+					if audioTokens < 1 {
+						audioTokens = 1
+					}
+					sumUsage.OutputTokens += audioTokens
+					sumUsage.OutputTokenDetails.AudioTokens += audioTokens
+					sumUsage.TotalTokens += audioTokens
+				}
+
+			case EventType_TTSEnded:
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "response.audio.done",
+				})
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "response.done",
+					"response": map[string]interface{}{"status": "completed"},
+				})
+				state.EndTurn()
+				_ = service.PreWssConsumeQuota(c, info, sumUsage)
+
+			case EventType_SessionFinished:
+				logger.LogInfo(c, "volcengine realtime session finished")
+
+			case EventType_UsageResponse:
+				logger.LogInfo(c, fmt.Sprintf("volcengine realtime usage: %s", string(msg.Payload)))
+
+			case EventType_ConnectionFailed:
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "error",
+					"error": map[string]interface{}{
+						"type":    "connection_error",
+						"message": string(msg.Payload),
+					},
+				})
+
+			default:
+				if msg.MsgType == MsgTypeError {
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "error",
+						"error": map[string]interface{}{
+							"type":    "server_error",
+							"code":    msg.ErrorCode,
+							"message": string(msg.Payload),
+						},
+					})
+				} else {
+					logger.LogInfo(c, fmt.Sprintf("volcengine realtime unhandled: %v", msg))
+				}
+			}
+		}
+	})
+
+	select {
+	case <-clientClosed:
+	case <-targetClosed:
+	case err := <-errChan:
+		logger.LogError(c, "volcengine realtime error: "+err.Error())
+	case <-c.Done():
+	}
+
+	return nil, sumUsage
+}
+
+func extractTextFromItem(event map[string]interface{}) string {
+	item, _ := event["item"].(map[string]interface{})
+	if item == nil {
+		return ""
+	}
+	content, _ := item["content"].([]interface{})
+	for _, c := range content {
+		if cm, ok := c.(map[string]interface{}); ok {
+			if t, ok := cm["text"].(string); ok && t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 )
 
@@ -278,6 +279,8 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 				return "wss://openspeech.bytedance.com/api/v1/tts/ws_binary", nil
 			}
 			return fmt.Sprintf("%s/v1/audio/speech", baseUrl), nil
+		case constant.RelayModeRealtime:
+			return "wss://openspeech.bytedance.com/api/v3/realtime/dialogue", nil
 		default:
 		}
 	}
@@ -286,6 +289,20 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, req)
+
+	if info.RelayMode == constant.RelayModeRealtime {
+		parts := strings.Split(info.ApiKey, "|")
+		if len(parts) == 2 {
+			req.Set("X-Api-App-Id", parts[0])
+			req.Set("X-Api-Access-Key", parts[1])
+		} else {
+			req.Set("x-api-key", info.ApiKey)
+		}
+		req.Set("X-Api-App-Key", "PlgvMymc7f3tQnJ6")
+		req.Set("X-Api-Resource-Id", "volc.speech.dialog")
+		req.Set("X-Api-Connect-Id", uuid.New().String())
+		return nil
+	}
 
 	if info.RelayMode == constant.RelayModeAudioSpeech {
 		parts := strings.Split(info.ApiKey, "|")
@@ -330,6 +347,9 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if info.RelayMode == constant.RelayModeRealtime {
+		return channel.DoWssRequest(a, c, info, requestBody)
+	}
 	if info.RelayMode == constant.RelayModeAudioSpeech {
 		baseUrl := info.ChannelBaseUrl
 		if baseUrl == "" {
@@ -346,6 +366,11 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	if info.RelayMode == constant.RelayModeRealtime {
+		err, realtimeUsage := VolcengineRealtimeHandler(c, info)
+		return realtimeUsage, err
+	}
+
 	if info.RelayFormat == types.RelayFormatClaude {
 		if _, ok := channelconstant.ChannelSpecialBases[info.ChannelBaseUrl]; ok {
 			adaptor := claude.Adaptor{}

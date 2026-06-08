@@ -111,7 +111,8 @@ const (
 	EventType_ASRResponse EventType = 451
 	EventType_ASREnded    EventType = 459
 
-	EventType_ChatTTSText EventType = 500
+	EventType_ChatTTSText   EventType = 500
+	EventType_UserTextQuery EventType = 501
 
 	EventType_ChatResponse EventType = 550
 	EventType_ChatEnded    EventType = 559
@@ -185,6 +186,8 @@ func (t EventType) String() string {
 		return "EventType_ASREnded"
 	case EventType_ChatTTSText:
 		return "EventType_ChatTTSText"
+	case EventType_UserTextQuery:
+		return "EventType_UserTextQuery"
 	case EventType_ChatResponse:
 		return "EventType_ChatResponse"
 	case EventType_ChatEnded:
