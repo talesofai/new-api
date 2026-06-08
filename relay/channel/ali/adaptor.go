@@ -99,6 +99,10 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 		}
 	default:
 		switch info.RelayMode {
+		case constant.RelayModeRealtime:
+			baseUrl := strings.Replace(info.ChannelBaseUrl, "https://", "wss://", 1)
+			baseUrl = strings.Replace(baseUrl, "http://", "ws://", 1)
+			fullRequestURL = fmt.Sprintf("%s/api-ws/v1/realtime?model=%s", baseUrl, info.UpstreamModelName)
 		case constant.RelayModeEmbeddings:
 			fullRequestURL = fmt.Sprintf("%s/compatible-mode/v1/embeddings", info.ChannelBaseUrl)
 		case constant.RelayModeRerank:
@@ -235,6 +239,9 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if info.RelayMode == constant.RelayModeRealtime {
+		return channel.DoWssRequest(a, c, info, requestBody)
+	}
 	return channel.DoApiRequest(a, c, info, requestBody)
 }
 
@@ -250,6 +257,8 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return adaptor.DoResponse(c, resp, info)
 	default:
 		switch info.RelayMode {
+		case constant.RelayModeRealtime:
+			err, usage = DashscopeRealtimeHandler(c, info)
 		case constant.RelayModeImagesGenerations:
 			err, usage = aliImageHandler(a, c, resp, info)
 		case constant.RelayModeImagesEdits:
