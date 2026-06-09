@@ -391,6 +391,14 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 					},
 				})
 
+			case EventType_SessionCanceled:
+				sendClientEvent(c, clientConn, map[string]interface{}{
+					"event_id": realtimeEventID(),
+					"type":     "response.done",
+					"response": map[string]interface{}{"status": "cancelled"},
+				})
+				state.EndTurn()
+
 			case EventType_ASRResponse:
 				if !dialogue {
 					continue
@@ -484,32 +492,32 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 			case EventType_TTSSentenceEnd:
 				var d map[string]interface{}
 				if common.Unmarshal(msg.Payload, &d) == nil {
-					if text, _ := d["res_params"].(map[string]interface{}); text != nil {
-						if t, _ := text["text"].(string); t != "" {
-							sendClientEvent(c, clientConn, map[string]interface{}{
-								"event_id": realtimeEventID(),
-								"type":     "response.audio_transcript.delta",
-								"delta":    t,
-							})
-							sumUsage.OutputTokens += len([]rune(t))
-							sumUsage.OutputTokenDetails.TextTokens += len([]rune(t))
-							sumUsage.TotalTokens += len([]rune(t))
-						}
+					if t, _ := d["text"].(string); t != "" {
+						sendClientEvent(c, clientConn, map[string]interface{}{
+							"event_id": realtimeEventID(),
+							"type":     "response.audio_transcript.delta",
+							"delta":    t,
+						})
+						sumUsage.OutputTokens += len([]rune(t))
+						sumUsage.OutputTokenDetails.TextTokens += len([]rune(t))
+						sumUsage.TotalTokens += len([]rune(t))
 					}
 				}
 
 			case EventType_TTSEnded:
-				sendClientEvent(c, clientConn, map[string]interface{}{
-					"event_id": realtimeEventID(),
-					"type":     "response.audio.done",
-				})
-				sendClientEvent(c, clientConn, map[string]interface{}{
-					"event_id": realtimeEventID(),
-					"type":     "response.done",
-					"response": map[string]interface{}{"status": "completed"},
-				})
-				state.EndTurn()
-				_ = service.PreWssConsumeQuota(c, info, sumUsage)
+				if dialogue {
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.audio.done",
+					})
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.done",
+						"response": map[string]interface{}{"status": "completed"},
+					})
+					state.EndTurn()
+					_ = service.PreWssConsumeQuota(c, info, sumUsage)
+				}
 
 			case EventType_SessionFinished:
 				if !dialogue {
