@@ -111,7 +111,8 @@ const (
 	EventType_ASRResponse EventType = 451
 	EventType_ASREnded    EventType = 459
 
-	EventType_ChatTTSText EventType = 500
+	EventType_ChatTTSText   EventType = 500
+	EventType_UserTextQuery EventType = 501
 
 	EventType_ChatResponse EventType = 550
 	EventType_ChatEnded    EventType = 559
@@ -185,6 +186,8 @@ func (t EventType) String() string {
 		return "EventType_ASREnded"
 	case EventType_ChatTTSText:
 		return "EventType_ChatTTSText"
+	case EventType_UserTextQuery:
+		return "EventType_UserTextQuery"
 	case EventType_ChatResponse:
 		return "EventType_ChatResponse"
 	case EventType_ChatEnded:
@@ -324,7 +327,7 @@ func (m *Message) Unmarshal(data []byte) error {
 		return err
 	}
 
-	m.Serialization = SerializationBits(serializationCompression & 0b11110000)
+	m.Serialization = SerializationBits(serializationCompression >> 4)
 	m.Compression = CompressionBits(serializationCompression & 0b00001111)
 
 	headerSize := 4 * int(m.HeaderSize)
