@@ -20,10 +20,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func isDialogueModel(model string) bool {
-	m := strings.ToLower(model)
-	return strings.Contains(m, "dialogue") || strings.Contains(m, "dialog") ||
-		strings.HasPrefix(m, "doubao-realtime")
+func isDialogueEndpoint(baseUrl string) bool {
+	return strings.Contains(baseUrl, "realtime/dialogue")
 }
 
 type realtimeState struct {
@@ -204,8 +202,8 @@ func buildDialogueConfig(session map[string]interface{}) []byte {
 }
 
 // VolcengineRealtimeHandler bridges an OpenAI-protocol client WebSocket to
-// the Volcengine realtime API (binary framing). It auto-detects TTS bidirectional
-// mode vs end-to-end dialogue mode based on the upstream model name.
+// the Volcengine realtime API (binary framing). TTS vs dialogue mode is
+// determined by the channel's base_url configuration.
 func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.RealtimeUsage) {
 	if info == nil || info.ClientWs == nil || info.TargetWs == nil {
 		return types.NewError(fmt.Errorf("invalid websocket connection"), types.ErrorCodeBadResponse), nil
@@ -214,7 +212,7 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 	info.IsStream = true
 	clientConn := info.ClientWs
 	targetConn := info.TargetWs
-	dialogue := isDialogueModel(info.UpstreamModelName)
+	dialogue := isDialogueEndpoint(info.ChannelBaseUrl)
 
 	state := &realtimeState{}
 	sumUsage := &dto.RealtimeUsage{}

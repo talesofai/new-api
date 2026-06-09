@@ -280,8 +280,8 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			}
 			return fmt.Sprintf("%s/v1/audio/speech", baseUrl), nil
 		case constant.RelayModeRealtime:
-			if isDialogueModel(info.UpstreamModelName) {
-				return "wss://openspeech.bytedance.com/api/v3/realtime/dialogue", nil
+			if strings.HasPrefix(baseUrl, "wss://") || strings.HasPrefix(baseUrl, "ws://") {
+				return baseUrl, nil
 			}
 			return "wss://openspeech.bytedance.com/api/v3/tts/bidirection", nil
 		default:
@@ -301,7 +301,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 		} else {
 			req.Set("X-Api-Key", info.ApiKey)
 		}
-		if isDialogueModel(info.UpstreamModelName) {
+		if isDialogueEndpoint(info.ChannelBaseUrl) {
 			req.Set("X-Api-Resource-Id", "volc.speech.dialog")
 		} else {
 			req.Set("X-Api-Resource-Id", info.UpstreamModelName)
