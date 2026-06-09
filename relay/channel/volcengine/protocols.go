@@ -327,7 +327,7 @@ func (m *Message) Unmarshal(data []byte) error {
 		return err
 	}
 
-	m.Serialization = SerializationBits(serializationCompression & 0b11110000)
+	m.Serialization = SerializationBits(serializationCompression >> 4)
 	m.Compression = CompressionBits(serializationCompression & 0b00001111)
 
 	headerSize := 4 * int(m.HeaderSize)

@@ -247,6 +247,7 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 
 	// Client → Upstream  (OpenAI JSON → Volcengine binary)
 	gopool.Go(func() {
+		defer close(clientClosed)
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
@@ -258,7 +259,6 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					errChan <- fmt.Errorf("error reading client: %v", readErr)
 				}
-				close(clientClosed)
 				return
 			}
 
@@ -356,6 +356,7 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 
 	// Upstream → Client  (Volcengine binary → OpenAI JSON)
 	gopool.Go(func() {
+		defer close(targetClosed)
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
@@ -367,7 +368,6 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					errChan <- fmt.Errorf("error reading target: %v", readErr)
 				}
-				close(targetClosed)
 				return
 			}
 			info.SetFirstResponseTime()
@@ -573,6 +573,11 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 		logger.LogError(c, "volcengine realtime error: "+err.Error())
 	case <-c.Done():
 	}
+
+	clientConn.Close()
+	targetConn.Close()
+	<-clientClosed
+	<-targetClosed
 
 	return nil, sumUsage
 }
