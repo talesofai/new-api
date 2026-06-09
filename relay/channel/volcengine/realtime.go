@@ -215,6 +215,7 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 	dialogue := isDialogueEndpoint(info.ChannelBaseUrl)
 
 	state := &realtimeState{}
+	turnUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
 
 	// --- connection handshake ---
@@ -448,9 +449,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 							"type":     "response.audio_transcript.delta",
 							"delta":    text,
 						})
-						sumUsage.OutputTokens += len([]rune(text))
-						sumUsage.OutputTokenDetails.TextTokens += len([]rune(text))
-						sumUsage.TotalTokens += len([]rune(text))
+						turnUsage.OutputTokens += len([]rune(text))
+						turnUsage.OutputTokenDetails.TextTokens += len([]rune(text))
+						turnUsage.TotalTokens += len([]rune(text))
 					}
 				}
 
@@ -484,9 +485,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 					if audioTokens < 1 {
 						audioTokens = 1
 					}
-					sumUsage.OutputTokens += audioTokens
-					sumUsage.OutputTokenDetails.AudioTokens += audioTokens
-					sumUsage.TotalTokens += audioTokens
+					turnUsage.OutputTokens += audioTokens
+					turnUsage.OutputTokenDetails.AudioTokens += audioTokens
+					turnUsage.TotalTokens += audioTokens
 				}
 
 			case EventType_TTSSentenceEnd:
@@ -498,9 +499,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 							"type":     "response.audio_transcript.delta",
 							"delta":    t,
 						})
-						sumUsage.OutputTokens += len([]rune(t))
-						sumUsage.OutputTokenDetails.TextTokens += len([]rune(t))
-						sumUsage.TotalTokens += len([]rune(t))
+						turnUsage.OutputTokens += len([]rune(t))
+						turnUsage.OutputTokenDetails.TextTokens += len([]rune(t))
+						turnUsage.TotalTokens += len([]rune(t))
 					}
 				}
 
@@ -516,7 +517,8 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 						"response": map[string]interface{}{"status": "completed"},
 					})
 					state.EndTurn()
-					_ = service.PreWssConsumeQuota(c, info, sumUsage)
+					_ = volcenginePreConsumeUsage(c, info, turnUsage, sumUsage)
+					turnUsage = &dto.RealtimeUsage{}
 				}
 
 			case EventType_SessionFinished:
@@ -531,7 +533,8 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 						"response": map[string]interface{}{"status": "completed"},
 					})
 					state.EndTurn()
-					_ = service.PreWssConsumeQuota(c, info, sumUsage)
+					_ = volcenginePreConsumeUsage(c, info, turnUsage, sumUsage)
+					turnUsage = &dto.RealtimeUsage{}
 				}
 				logger.LogInfo(c, "volcengine realtime session finished")
 
@@ -579,7 +582,23 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 	<-clientClosed
 	<-targetClosed
 
+	if turnUsage.TotalTokens > 0 {
+		_ = volcenginePreConsumeUsage(c, info, turnUsage, sumUsage)
+	}
+
 	return nil, sumUsage
+}
+
+func volcenginePreConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {
+	totalUsage.TotalTokens += usage.TotalTokens
+	totalUsage.InputTokens += usage.InputTokens
+	totalUsage.OutputTokens += usage.OutputTokens
+	totalUsage.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
+	totalUsage.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
+	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
+	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
+	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
+	return service.PreWssConsumeQuota(ctx, info, usage)
 }
 
 func extractTextFromItem(event map[string]interface{}) string {
