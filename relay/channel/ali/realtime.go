@@ -27,78 +27,21 @@ func eventID() string {
 	return "evt_" + raw
 }
 
-// getStringOrDefault returns the string value for key in m, or defaultVal if
-// the key is absent or not a string.
-func getStringOrDefault(m map[string]interface{}, key, defaultVal string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok && s != "" {
-			return s
-		}
-	}
-	return defaultVal
-}
-
-// getNumberOrDefault returns the numeric value for key in m, or defaultVal if
-// the key is absent or not a number.
-func getNumberOrDefault(m map[string]interface{}, key string, defaultVal float64) float64 {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case float64:
-			return n
-		case int:
-			return float64(n)
-		}
-	}
-	return defaultVal
-}
-
-type dashscopeModelType int
-
-const (
-	dashscopeModelTTS dashscopeModelType = iota
-	dashscopeModelASR
-	dashscopeModelOmni
-)
-
-func detectDashscopeModelType(modelName string) dashscopeModelType {
-	lower := strings.ToLower(modelName)
-	if strings.Contains(lower, "tts") {
-		return dashscopeModelTTS
-	}
-	if strings.Contains(lower, "asr") {
-		return dashscopeModelASR
-	}
-	return dashscopeModelOmni
-}
-
-// openaiToQwen converts an OpenAI realtime client event to Dashscope format.
-// For TTS models, conversation.item.create and response.create are remapped to
-// input_text_buffer events. For ASR and Omni models, these events pass through
-// unchanged since Dashscope natively supports the OpenAI event names.
-// Returns the converted message bytes, or nil if the event should be dropped.
-func openaiToQwen(message []byte, modelName string) []byte {
+// openaiToQwen strips internal fields from session.update events and ensures
+// event_id presence. Dashscope's realtime API (for qwen-omni-*-realtime models)
+// is OpenAI-compatible, so all other events pass through unchanged.
+func openaiToQwen(message []byte) []byte {
 	var event map[string]interface{}
 	if err := common.Unmarshal(message, &event); err != nil {
-		return message // can't parse, passthrough
+		return message
 	}
 
 	evtType, _ := event["type"].(string)
-	modelType := detectDashscopeModelType(modelName)
 
-	switch evtType {
-	case "session.update":
-		return convertSessionUpdate(event, modelType)
-	case "conversation.item.create":
-		if modelType == dashscopeModelTTS {
-			return convertItemCreate(event)
-		}
-	case "response.create":
-		if modelType == dashscopeModelTTS {
-			return convertResponseCreate()
-		}
+	if evtType == "session.update" {
+		return stripSessionInternalFields(event)
 	}
 
-	// Passthrough: ensure event_id exists
 	if _, ok := event["event_id"]; !ok {
 		event["event_id"] = eventID()
 		converted, _ := common.Marshal(event)
@@ -107,128 +50,33 @@ func openaiToQwen(message []byte, modelName string) []byte {
 	return message
 }
 
-// convertSessionUpdate remaps an OpenAI session.update event to Dashscope
-// format, adjusting fields based on the model type:
-//   - TTS: voice, mode, response_format, sample_rate
-//   - ASR: input_audio_format, sample_rate, turn_detection
-//   - Omni: modalities, voice, input/output_audio_format, turn_detection, instructions, tools
-//
-// Internal fields (llm_api_base, llm_api_key, llm_model, preset_key) are always stripped.
-func convertSessionUpdate(event map[string]interface{}, modelType dashscopeModelType) []byte {
+// stripSessionInternalFields removes fields that should not be forwarded
+// to the upstream (security-sensitive or proxy-internal).
+func stripSessionInternalFields(event map[string]interface{}) []byte {
 	session, _ := event["session"].(map[string]interface{})
 	if session == nil {
 		session = map[string]interface{}{}
 	}
 
-	internalFields := map[string]bool{
+	stripped := map[string]bool{
 		"llm_api_base": true,
 		"llm_api_key":  true,
 		"llm_model":    true,
 		"preset_key":   true,
 	}
 
-	var qwenSession map[string]interface{}
-
-	switch modelType {
-	case dashscopeModelTTS:
-		qwenSession = map[string]interface{}{
-			"voice":           getStringOrDefault(session, "voice", "Cherry"),
-			"mode":            getStringOrDefault(session, "mode", "server_commit"),
-			"response_format": getStringOrDefault(session, "response_format", "pcm"),
-			"sample_rate":     getNumberOrDefault(session, "sample_rate", 24000),
-		}
-		for _, k := range []string{"voice", "mode", "response_format", "sample_rate"} {
-			internalFields[k] = true
-		}
-
-	case dashscopeModelASR:
-		qwenSession = map[string]interface{}{
-			"input_audio_format": getStringOrDefault(session, "input_audio_format", "pcm"),
-			"sample_rate":        getNumberOrDefault(session, "sample_rate", 16000),
-		}
-		if v, ok := session["turn_detection"]; ok {
-			qwenSession["turn_detection"] = v
-		}
-		if v, ok := session["input_audio_transcription"]; ok {
-			qwenSession["input_audio_transcription"] = v
-		}
-		for _, k := range []string{"input_audio_format", "sample_rate",
-			"voice", "mode", "response_format", "output_audio_format"} {
-			internalFields[k] = true
-		}
-
-	default: // dashscopeModelOmni
-		qwenSession = map[string]interface{}{}
-		if _, ok := session["modalities"]; !ok {
-			qwenSession["modalities"] = []string{"text", "audio"}
-		}
-		if _, ok := session["voice"]; !ok {
-			qwenSession["voice"] = "Cherry"
-		}
-		if _, ok := session["input_audio_format"]; !ok {
-			qwenSession["input_audio_format"] = "pcm"
-		}
-		if _, ok := session["output_audio_format"]; !ok {
-			qwenSession["output_audio_format"] = "pcm"
-		}
-		for _, k := range []string{"mode", "response_format"} {
-			internalFields[k] = true
-		}
-	}
-
+	qwenSession := map[string]interface{}{}
 	for k, v := range session {
-		if internalFields[k] {
+		if stripped[k] {
 			continue
 		}
-		if _, exists := qwenSession[k]; !exists {
-			qwenSession[k] = v
-		}
+		qwenSession[k] = v
 	}
 
 	result := map[string]interface{}{
 		"event_id": eventID(),
 		"type":     "session.update",
 		"session":  qwenSession,
-	}
-	converted, _ := common.Marshal(result)
-	return converted
-}
-
-// convertItemCreate converts an OpenAI conversation.item.create event to a
-// Dashscope input_text_buffer.append event, extracting text from the item
-// content array.
-func convertItemCreate(event map[string]interface{}) []byte {
-	item, _ := event["item"].(map[string]interface{})
-	if item == nil {
-		return nil
-	}
-	content, _ := item["content"].([]interface{})
-	var texts []string
-	for _, c := range content {
-		if cm, ok := c.(map[string]interface{}); ok {
-			if t, ok := cm["text"].(string); ok && t != "" {
-				texts = append(texts, t)
-			}
-		}
-	}
-	if len(texts) == 0 {
-		return nil
-	}
-	result := map[string]interface{}{
-		"event_id": eventID(),
-		"type":     "input_text_buffer.append",
-		"text":     strings.Join(texts, " "),
-	}
-	converted, _ := common.Marshal(result)
-	return converted
-}
-
-// convertResponseCreate converts an OpenAI response.create event to a
-// Dashscope input_text_buffer.commit event.
-func convertResponseCreate() []byte {
-	result := map[string]interface{}{
-		"event_id": eventID(),
-		"type":     "input_text_buffer.commit",
 	}
 	converted, _ := common.Marshal(result)
 	return converted
@@ -309,8 +157,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 				localUsage.InputTokenDetails.AudioTokens += audioToken
 			}
 
-			// Convert OpenAI -> Dashscope
-			converted := openaiToQwen(message, info.UpstreamModelName)
+			converted := openaiToQwen(message)
 			if converted == nil {
 				continue // event was dropped (e.g. empty text)
 			}
