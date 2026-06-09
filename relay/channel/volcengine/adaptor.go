@@ -280,7 +280,10 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			}
 			return fmt.Sprintf("%s/v1/audio/speech", baseUrl), nil
 		case constant.RelayModeRealtime:
-			return "wss://openspeech.bytedance.com/api/v3/realtime/dialogue", nil
+			if isDialogueModel(info.UpstreamModelName) {
+				return "wss://openspeech.bytedance.com/api/v3/realtime/dialogue", nil
+			}
+			return "wss://openspeech.bytedance.com/api/v3/tts/bidirection", nil
 		default:
 		}
 	}
@@ -296,10 +299,13 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 			req.Set("X-Api-App-Id", parts[0])
 			req.Set("X-Api-Access-Key", parts[1])
 		} else {
-			req.Set("x-api-key", info.ApiKey)
+			req.Set("X-Api-Key", info.ApiKey)
 		}
-		req.Set("X-Api-App-Key", "PlgvMymc7f3tQnJ6")
-		req.Set("X-Api-Resource-Id", "volc.speech.dialog")
+		if isDialogueModel(info.UpstreamModelName) {
+			req.Set("X-Api-Resource-Id", "volc.speech.dialog")
+		} else {
+			req.Set("X-Api-Resource-Id", info.UpstreamModelName)
+		}
 		req.Set("X-Api-Connect-Id", uuid.New().String())
 		return nil
 	}

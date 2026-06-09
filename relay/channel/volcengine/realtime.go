@@ -20,6 +20,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func isDialogueModel(model string) bool {
+	m := strings.ToLower(model)
+	return strings.Contains(m, "dialogue") || strings.Contains(m, "dialog") ||
+		strings.HasPrefix(m, "doubao-realtime")
+}
+
 type realtimeState struct {
 	mu        sync.RWMutex
 	sessionID string
@@ -105,6 +111,56 @@ func sendBinaryAudio(conn *websocket.Conn, event EventType, sessionID string, au
 	return conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
+// buildTTSConfig builds a StartSession payload for the bidirectional TTS API.
+func buildTTSConfig(session map[string]interface{}) []byte {
+	speaker := "zh_female_shuangkuaisisi_moon_bigtts"
+	if v, ok := session["voice"].(string); ok && v != "" {
+		speaker = v
+	}
+	format := "pcm"
+	if v, ok := session["output_audio_format"].(string); ok && v != "" {
+		format = v
+	}
+	sampleRate := float64(24000)
+	if v, ok := session["sample_rate"].(float64); ok && v > 0 {
+		sampleRate = v
+	}
+
+	config := map[string]interface{}{
+		"event":     100,
+		"namespace": "BidirectionalTTS",
+		"req_params": map[string]interface{}{
+			"speaker": speaker,
+			"audio_params": map[string]interface{}{
+				"format":      format,
+				"sample_rate": int(sampleRate),
+			},
+		},
+	}
+
+	if additions := buildTTSAdditions(session); len(additions) > 0 {
+		config["req_params"].(map[string]interface{})["additions"] = additions
+	}
+
+	data, _ := common.Marshal(config)
+	return data
+}
+
+func buildTTSAdditions(session map[string]interface{}) map[string]interface{} {
+	additions := map[string]interface{}{}
+	if v, ok := session["disable_markdown_filter"].(bool); ok {
+		additions["disable_markdown_filter"] = v
+	}
+	if v, ok := session["enable_language_detector"].(bool); ok {
+		additions["enable_language_detector"] = v
+	}
+	if v, ok := session["explicit_language"].(string); ok && v != "" {
+		additions["explicit_language"] = v
+	}
+	return additions
+}
+
+// buildDialogueConfig builds a StartSession payload for the realtime dialogue API.
 func buildDialogueConfig(session map[string]interface{}) []byte {
 	voice := "zh_female_cancan"
 	if v, ok := session["voice"].(string); ok && v != "" {
@@ -148,8 +204,8 @@ func buildDialogueConfig(session map[string]interface{}) []byte {
 }
 
 // VolcengineRealtimeHandler bridges an OpenAI-protocol client WebSocket to
-// the Volcengine end-to-end realtime dialogue API (binary framing at
-// wss://openspeech.bytedance.com/api/v3/realtime/dialogue).
+// the Volcengine realtime API (binary framing). It auto-detects TTS bidirectional
+// mode vs end-to-end dialogue mode based on the upstream model name.
 func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.RealtimeUsage) {
 	if info == nil || info.ClientWs == nil || info.TargetWs == nil {
 		return types.NewError(fmt.Errorf("invalid websocket connection"), types.ErrorCodeBadResponse), nil
@@ -158,6 +214,7 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 	info.IsStream = true
 	clientConn := info.ClientWs
 	targetConn := info.TargetWs
+	dialogue := isDialogueModel(info.UpstreamModelName)
 
 	state := &realtimeState{}
 	sumUsage := &dto.RealtimeUsage{}
@@ -228,13 +285,23 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				if session == nil {
 					session = map[string]interface{}{}
 				}
-				cfg := buildDialogueConfig(session)
-				if sendErr := sendBinaryJSON(targetConn, EventType_StartSession, "", cfg); sendErr != nil {
+				newSid := uuid.New().String()
+				state.SetSessionID(newSid)
+				var cfg []byte
+				if dialogue {
+					cfg = buildDialogueConfig(session)
+				} else {
+					cfg = buildTTSConfig(session)
+				}
+				if sendErr := sendBinaryJSON(targetConn, EventType_StartSession, newSid, cfg); sendErr != nil {
 					errChan <- fmt.Errorf("StartSession send failed: %v", sendErr)
 					return
 				}
 
 			case "input_audio_buffer.append":
+				if !dialogue {
+					continue
+				}
 				audioB64, _ := event["audio"].(string)
 				if audioB64 == "" {
 					continue
@@ -249,21 +316,39 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				}
 
 			case "input_audio_buffer.commit", "input_audio_buffer.clear":
-				// No direct equivalent in the dialogue protocol
+				// No direct equivalent
 
 			case "conversation.item.create":
 				text := extractTextFromItem(event)
 				if text == "" {
 					continue
 				}
-				payload, _ := common.Marshal(map[string]interface{}{"text": text})
-				if sendErr := sendBinaryJSON(targetConn, EventType_UserTextQuery, sid, payload); sendErr != nil {
-					errChan <- fmt.Errorf("UserTextQuery send failed: %v", sendErr)
-					return
+				if dialogue {
+					payload, _ := common.Marshal(map[string]interface{}{"text": text})
+					if sendErr := sendBinaryJSON(targetConn, EventType_UserTextQuery, sid, payload); sendErr != nil {
+						errChan <- fmt.Errorf("UserTextQuery send failed: %v", sendErr)
+						return
+					}
+				} else {
+					payload, _ := common.Marshal(map[string]interface{}{
+						"event":     200,
+						"namespace": "BidirectionalTTS",
+						"req_params": map[string]interface{}{
+							"text": text,
+						},
+					})
+					if sendErr := sendBinaryJSON(targetConn, EventType_TaskRequest, sid, payload); sendErr != nil {
+						errChan <- fmt.Errorf("TaskRequest send failed: %v", sendErr)
+						return
+					}
 				}
 
 			case "response.create":
-				// Volcengine dialogue auto-responds; no explicit trigger needed
+				if !dialogue {
+					// For TTS mode, response.create after text means we're done sending text.
+					// Send FinishSession to trigger final audio flush.
+					_ = sendBinaryJSON(targetConn, EventType_FinishSession, sid, []byte("{}"))
+				}
 
 			case "response.cancel":
 				_ = sendBinaryJSON(targetConn, EventType_CancelSession, sid, []byte("{}"))
@@ -309,6 +394,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				})
 
 			case EventType_ASRResponse:
+				if !dialogue {
+					continue
+				}
 				var d map[string]interface{}
 				if common.Unmarshal(msg.Payload, &d) == nil {
 					if text, _ := d["text"].(string); text != "" {
@@ -321,6 +409,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				}
 
 			case EventType_ASRInfo:
+				if !dialogue {
+					continue
+				}
 				var d map[string]interface{}
 				if common.Unmarshal(msg.Payload, &d) == nil {
 					if text, _ := d["text"].(string); text != "" {
@@ -333,6 +424,9 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				}
 
 			case EventType_ChatResponse:
+				if !dialogue {
+					continue
+				}
 				if state.StartTurn() {
 					sendClientEvent(c, clientConn, map[string]interface{}{
 						"event_id": realtimeEventID(),
@@ -355,10 +449,22 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				}
 
 			case EventType_ChatEnded:
+				if !dialogue {
+					continue
+				}
 				sendClientEvent(c, clientConn, map[string]interface{}{
 					"event_id": realtimeEventID(),
 					"type":     "response.audio_transcript.done",
 				})
+
+			case EventType_TTSSentenceStart:
+				if state.StartTurn() {
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.created",
+						"response": map[string]interface{}{"status": "in_progress"},
+					})
+				}
 
 			case EventType_TTSResponse:
 				if len(msg.Payload) > 0 {
@@ -377,6 +483,23 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 					sumUsage.TotalTokens += audioTokens
 				}
 
+			case EventType_TTSSentenceEnd:
+				var d map[string]interface{}
+				if common.Unmarshal(msg.Payload, &d) == nil {
+					if text, _ := d["res_params"].(map[string]interface{}); text != nil {
+						if t, _ := text["text"].(string); t != "" {
+							sendClientEvent(c, clientConn, map[string]interface{}{
+								"event_id": realtimeEventID(),
+								"type":     "response.audio_transcript.delta",
+								"delta":    t,
+							})
+							sumUsage.OutputTokens += len([]rune(t))
+							sumUsage.OutputTokenDetails.TextTokens += len([]rune(t))
+							sumUsage.TotalTokens += len([]rune(t))
+						}
+					}
+				}
+
 			case EventType_TTSEnded:
 				sendClientEvent(c, clientConn, map[string]interface{}{
 					"event_id": realtimeEventID(),
@@ -391,6 +514,19 @@ func VolcengineRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*ty
 				_ = service.PreWssConsumeQuota(c, info, sumUsage)
 
 			case EventType_SessionFinished:
+				if !dialogue {
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.audio.done",
+					})
+					sendClientEvent(c, clientConn, map[string]interface{}{
+						"event_id": realtimeEventID(),
+						"type":     "response.done",
+						"response": map[string]interface{}{"status": "completed"},
+					})
+					state.EndTurn()
+					_ = service.PreWssConsumeQuota(c, info, sumUsage)
+				}
 				logger.LogInfo(c, "volcengine realtime session finished")
 
 			case EventType_UsageResponse:
