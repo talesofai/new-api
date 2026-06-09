@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -57,11 +58,6 @@ func openaiToQwen(message []byte) []byte {
 // stripSessionInternalFields removes fields that should not be forwarded
 // to the upstream (security-sensitive or proxy-internal).
 func stripSessionInternalFields(event map[string]interface{}) []byte {
-	session, _ := event["session"].(map[string]interface{})
-	if session == nil {
-		session = map[string]interface{}{}
-	}
-
 	stripped := map[string]bool{
 		"llm_api_base": true,
 		"llm_api_key":  true,
@@ -69,20 +65,17 @@ func stripSessionInternalFields(event map[string]interface{}) []byte {
 		"preset_key":   true,
 	}
 
-	qwenSession := map[string]interface{}{}
-	for k, v := range session {
-		if stripped[k] {
-			continue
+	if session, ok := event["session"].(map[string]interface{}); ok {
+		for k := range stripped {
+			delete(session, k)
 		}
-		qwenSession[k] = v
 	}
 
-	result := map[string]interface{}{
-		"event_id": eventID(),
-		"type":     "session.update",
-		"session":  qwenSession,
+	if _, ok := event["event_id"]; !ok {
+		event["event_id"] = eventID()
 	}
-	converted, _ := common.Marshal(result)
+
+	converted, _ := common.Marshal(event)
 	return converted
 }
 
@@ -175,7 +168,8 @@ func handleVoiceCreate(c *gin.Context, info *relaycommon.RelayInfo, event map[st
 	httpReq.Header.Set("Authorization", "Bearer "+info.ApiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		sendClientEvent(c, clientConn, clientMu, map[string]interface{}{
 			"type":     "error",
@@ -267,6 +261,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 	localUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
 	var clientMu sync.Mutex
+	var usageMu sync.Mutex
 
 	// Close both connections when context is cancelled, which unblocks any
 	// blocking ReadMessage calls in the goroutines below.
@@ -278,6 +273,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 
 	// Client -> Target (with OpenAI -> Dashscope conversion)
 	gopool.Go(func() {
+		defer close(clientClosed)
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
@@ -289,7 +285,6 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					errChan <- fmt.Errorf("error reading from client: %v", err)
 				}
-				close(clientClosed)
 				return
 			}
 
@@ -342,10 +337,12 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 					return
 				}
 				logger.LogInfo(c, fmt.Sprintf("dashscope client type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+				usageMu.Lock()
 				localUsage.TotalTokens += textToken + audioToken
 				localUsage.InputTokens += textToken + audioToken
 				localUsage.InputTokenDetails.TextTokens += textToken
 				localUsage.InputTokenDetails.AudioTokens += audioToken
+				usageMu.Unlock()
 			}
 
 			converted := openaiToQwen(message)
@@ -362,6 +359,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 
 	// Target -> Client (passthrough, Dashscope events are OpenAI-compatible)
 	gopool.Go(func() {
+		defer close(targetClosed)
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
@@ -373,7 +371,6 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					errChan <- fmt.Errorf("error reading from target: %v", err)
 				}
-				close(targetClosed)
 				return
 			}
 			info.SetFirstResponseTime()
@@ -383,6 +380,7 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 				if realtimeEvent.Type == dto.RealtimeEventTypeResponseDone && realtimeEvent.Response != nil {
 					realtimeUsage := realtimeEvent.Response.Usage
 					if realtimeUsage != nil {
+						usageMu.Lock()
 						usage.TotalTokens += realtimeUsage.TotalTokens
 						usage.InputTokens += realtimeUsage.InputTokens
 						usage.OutputTokens += realtimeUsage.OutputTokens
@@ -391,14 +389,14 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 						usage.InputTokenDetails.TextTokens += realtimeUsage.InputTokenDetails.TextTokens
 						usage.OutputTokenDetails.AudioTokens += realtimeUsage.OutputTokenDetails.AudioTokens
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
-
 						preConsumeErr := dashscopePreConsumeUsage(c, info, usage, sumUsage)
+						usage = &dto.RealtimeUsage{}
+						localUsage = &dto.RealtimeUsage{}
+						usageMu.Unlock()
 						if preConsumeErr != nil {
 							errChan <- fmt.Errorf("error consume usage: %v", preConsumeErr)
 							return
 						}
-						usage = &dto.RealtimeUsage{}
-						localUsage = &dto.RealtimeUsage{}
 					} else {
 						textToken, audioToken, countErr := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if countErr != nil {
@@ -406,18 +404,19 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 							return
 						}
 						logger.LogInfo(c, fmt.Sprintf("dashscope target type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+						usageMu.Lock()
 						localUsage.TotalTokens += textToken + audioToken
 						info.IsFirstRequest = false
 						localUsage.InputTokens += textToken + audioToken
 						localUsage.InputTokenDetails.TextTokens += textToken
 						localUsage.InputTokenDetails.AudioTokens += audioToken
-
 						preConsumeErr := dashscopePreConsumeUsage(c, info, localUsage, sumUsage)
+						localUsage = &dto.RealtimeUsage{}
+						usageMu.Unlock()
 						if preConsumeErr != nil {
 							errChan <- fmt.Errorf("error consume usage: %v", preConsumeErr)
 							return
 						}
-						localUsage = &dto.RealtimeUsage{}
 					}
 					logger.LogInfo(c, fmt.Sprintf("dashscope realtime sumUsage: %v", sumUsage))
 				} else if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdated || realtimeEvent.Type == dto.RealtimeEventTypeSessionCreated {
@@ -433,10 +432,12 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 						return
 					}
 					logger.LogInfo(c, fmt.Sprintf("dashscope target type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+					usageMu.Lock()
 					localUsage.TotalTokens += textToken + audioToken
 					localUsage.OutputTokens += textToken + audioToken
 					localUsage.OutputTokenDetails.TextTokens += textToken
 					localUsage.OutputTokenDetails.AudioTokens += audioToken
+					usageMu.Unlock()
 				}
 			}
 
@@ -458,7 +459,11 @@ func DashscopeRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*typ
 	case <-c.Done():
 	}
 
-	// Flush any remaining usage
+	clientConn.Close()
+	targetConn.Close()
+	<-clientClosed
+	<-targetClosed
+
 	if usage.TotalTokens != 0 {
 		_ = dashscopePreConsumeUsage(c, info, usage, sumUsage)
 	}
