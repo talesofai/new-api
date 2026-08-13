@@ -86,25 +86,24 @@ func calculateAudioQuota(info QuotaInfo) int {
 	return int(quota.Round(0).IntPart())
 }
 
-func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+// PreWssConsumeQuota 在 realtime 会话每轮 response 完成时被调用一次。
+// usage 是本轮增量用量，cumulativeUsage 是本次会话开始至今的累计用量（由调用方维护）。
+//
+// 有 BillingSession 时（正常计费路径）：按累计用量算出目标预扣额度，通过
+// BillingSession.Reserve 把预扣额度补到这个目标值。Reserve 内部只对
+// (目标值-已预扣值) 的增量做真实扣款，从而让"逐轮预扣"与连接关闭时
+// PostWssConsumeQuota 按累计用量做的最终 Settle 共用同一份预扣基准。
+// 历史实现是直接对本轮增量做 PostConsumeQuota 立即扣款，与 Settle 的累计结算
+// 互不知情，导致一次 realtime 会话的费用被多扣近一倍，这里改用 Reserve 修复。
+//
+// 无 BillingSession 时（例如免费模型跳过了预扣费），保留原有的按本轮增量直接
+// 扣款路径，行为不变。
+func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage, cumulativeUsage *dto.RealtimeUsage) error {
 	if relayInfo.UsePrice {
 		return nil
 	}
-	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
-	if err != nil {
-		return err
-	}
-
-	token, err := model.GetTokenByKey(strings.TrimPrefix(relayInfo.TokenKey, "sk-"), false)
-	if err != nil {
-		return err
-	}
 
 	modelName := relayInfo.OriginModelName
-	textInputTokens := usage.InputTokenDetails.TextTokens
-	textOutTokens := usage.OutputTokenDetails.TextTokens
-	audioInputTokens := usage.InputTokenDetails.AudioTokens
-	audioOutTokens := usage.OutputTokenDetails.AudioTokens
 	groupRatio := ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
 	modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
 
@@ -121,22 +120,52 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 		actualGroupRatio = userGroupRatio
 	}
 
-	quotaInfo := QuotaInfo{
-		InputDetails: TokenDetails{
-			TextTokens:  textInputTokens,
-			AudioTokens: audioInputTokens,
-		},
-		OutputDetails: TokenDetails{
-			TextTokens:  textOutTokens,
-			AudioTokens: audioOutTokens,
-		},
-		ModelName:  modelName,
-		UsePrice:   relayInfo.UsePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: actualGroupRatio,
+	quotaFor := func(u *dto.RealtimeUsage) int {
+		return calculateAudioQuota(QuotaInfo{
+			InputDetails: TokenDetails{
+				TextTokens:  u.InputTokenDetails.TextTokens,
+				AudioTokens: u.InputTokenDetails.AudioTokens,
+			},
+			OutputDetails: TokenDetails{
+				TextTokens:  u.OutputTokenDetails.TextTokens,
+				AudioTokens: u.OutputTokenDetails.AudioTokens,
+			},
+			ModelName:  modelName,
+			UsePrice:   relayInfo.UsePrice,
+			ModelRatio: modelRatio,
+			GroupRatio: actualGroupRatio,
+		})
 	}
 
-	quota := calculateAudioQuota(quotaInfo)
+	if relayInfo.Billing != nil {
+		cumulativeQuota := quotaFor(cumulativeUsage)
+		alreadyReserved := relayInfo.Billing.GetPreConsumedQuota()
+		if delta := cumulativeQuota - alreadyReserved; delta > 0 {
+			userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
+			if err != nil {
+				return err
+			}
+			if userQuota < delta {
+				return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(delta))
+			}
+		}
+		if err := relayInfo.Billing.Reserve(cumulativeQuota); err != nil {
+			return err
+		}
+		logger.LogInfo(ctx, "realtime streaming reserve quota success, cumulative quota: "+fmt.Sprintf("%d", cumulativeQuota))
+		return nil
+	}
+
+	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
+	if err != nil {
+		return err
+	}
+	token, err := model.GetTokenByKey(strings.TrimPrefix(relayInfo.TokenKey, "sk-"), false)
+	if err != nil {
+		return err
+	}
+
+	quota := quotaFor(usage)
 
 	if userQuota < quota {
 		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))

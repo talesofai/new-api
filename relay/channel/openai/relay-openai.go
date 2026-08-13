@@ -550,8 +550,9 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
 	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
 	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
-	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
+	// totalUsage 此时已经是累计到本轮为止的会话用量，与 usage（本轮增量）一并传入，
+	// 供 PreWssConsumeQuota 按累计用量做 Reserve，避免与连接关闭时的最终 Settle 重复扣费。
+	err := service.PreWssConsumeQuota(ctx, info, usage, totalUsage)
 	return err
 }
 
